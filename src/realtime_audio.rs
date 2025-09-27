@@ -24,6 +24,108 @@ pub struct AudioFrame {
     pub sequence: u32,
 }
 
+/// Zero-copy audio buffer for efficient memory management
+pub struct ZeroCopyAudioBuffer {
+    /// Pre-allocated memory pool for audio frames
+    frame_pool: Vec<AudioFrame>,
+    /// Available frame indices (acts as a free list)
+    free_indices: std::collections::VecDeque<usize>,
+    /// Pool capacity
+    capacity: usize,
+}
+
+impl ZeroCopyAudioBuffer {
+    /// Create new zero-copy audio buffer pool
+    pub fn new(capacity: usize) -> Self {
+        info!("Creating zero-copy audio buffer pool with {} frames", capacity);
+
+        // Pre-allocate all frames
+        let mut frame_pool = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            frame_pool.push(AudioFrame {
+                samples: [0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize],
+                timestamp: 0,
+                sequence: i as u32,
+            });
+        }
+
+        // Initialize free list with all indices
+        let mut free_indices = std::collections::VecDeque::with_capacity(capacity);
+        for i in 0..capacity {
+            free_indices.push_back(i);
+        }
+
+        Self {
+            frame_pool,
+            free_indices,
+            capacity,
+        }
+    }
+
+    /// Acquire a frame from the pool (zero-copy)
+    pub fn acquire_frame(&mut self) -> Option<&mut AudioFrame> {
+        if let Some(index) = self.free_indices.pop_front() {
+            // Return mutable reference to pre-allocated frame
+            Some(&mut self.frame_pool[index])
+        } else {
+            // Pool exhausted
+            None
+        }
+    }
+
+    /// Release a frame back to the pool
+    pub fn release_frame(&mut self, frame: &AudioFrame) {
+        // Find the frame's index in the pool
+        let frame_ptr = frame as *const AudioFrame;
+        let pool_start = self.frame_pool.as_ptr();
+
+        // Calculate index from pointer arithmetic
+        let index = unsafe {
+            (frame_ptr.offset_from(pool_start)) as usize
+        };
+
+        if index < self.capacity {
+            // Clear frame data for reuse
+            // Safety: We know this index is valid
+            unsafe {
+                let frame_mut = &mut *self.frame_pool.as_mut_ptr().add(index);
+                frame_mut.samples.fill(0.0);
+                frame_mut.timestamp = 0;
+            }
+
+            // Return to free list
+            self.free_indices.push_back(index);
+        }
+    }
+
+    /// Get pool statistics
+    pub fn get_stats(&self) -> ZeroCopyBufferStats {
+        ZeroCopyBufferStats {
+            total_capacity: self.capacity,
+            available_frames: self.free_indices.len(),
+            allocated_frames: self.capacity - self.free_indices.len(),
+        }
+    }
+}
+
+/// Zero-copy buffer statistics
+#[derive(Debug, Clone)]
+pub struct ZeroCopyBufferStats {
+    pub total_capacity: usize,
+    pub available_frames: usize,
+    pub allocated_frames: usize,
+}
+
+impl ZeroCopyBufferStats {
+    pub fn utilization_percent(&self) -> f32 {
+        if self.total_capacity > 0 {
+            (self.allocated_frames as f32 / self.total_capacity as f32) * 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
 impl AudioFrame {
     pub fn new() -> Self {
         Self {

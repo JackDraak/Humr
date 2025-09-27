@@ -2,6 +2,8 @@ mod audio;
 mod realtime_audio;
 mod jitter_buffer;
 mod opus_codec;
+mod noise_suppression;
+mod echo_cancellation;
 mod network;
 mod ui;
 mod app;
