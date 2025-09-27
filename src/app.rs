@@ -2,14 +2,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use anyhow::Result;
+use log::{info, warn, error};
 
 use crate::audio::AudioProcessor;
+use crate::realtime_audio::RealTimeAudioProcessor;
 use crate::network::{NetworkManager, ConnectionConfig};
 use crate::ui::UserInterface;
 use crate::security::SecurityConfig;
 
 pub struct VocalCommunicationApp {
+    // Legacy audio processor (for configuration and UI)
     audio_processor: Arc<Mutex<AudioProcessor>>,
+    // New real-time audio processor (lock-free)
+    realtime_audio: Option<RealTimeAudioProcessor>,
     network_manager: Arc<Mutex<NetworkManager>>,
     user_interface: Arc<Mutex<UserInterface>>,
     is_running: bool,
@@ -17,7 +22,24 @@ pub struct VocalCommunicationApp {
 
 impl VocalCommunicationApp {
     pub fn new() -> Self {
+        // Initialize logging
+        if env_logger::try_init().is_ok() {
+            info!("Logging initialized");
+        }
+
         let audio_processor = Arc::new(Mutex::new(AudioProcessor::new()));
+
+        // Initialize real-time audio processor
+        let realtime_audio = match RealTimeAudioProcessor::new() {
+            Ok(processor) => {
+                info!("Real-time audio processor created successfully");
+                Some(processor)
+            }
+            Err(e) => {
+                error!("Failed to create real-time audio processor: {}", e);
+                None
+            }
+        };
 
         // Create security configuration for encrypted communications
         let security_config = SecurityConfig::new().expect("Failed to create security config");
@@ -38,6 +60,7 @@ impl VocalCommunicationApp {
 
         Self {
             audio_processor,
+            realtime_audio,
             network_manager,
             user_interface,
             is_running: false,
@@ -45,21 +68,26 @@ impl VocalCommunicationApp {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        info!("Starting Humr voice communication application");
         self.is_running = true;
 
-        // Start audio capture thread
-        let audio_clone = self.audio_processor.clone();
+        // Initialize and start real-time audio processor
+        if let Some(ref mut realtime_audio) = self.realtime_audio {
+            info!("Initializing real-time audio system");
+            realtime_audio.initialize()?;
+            realtime_audio.start()?;
+            info!("Real-time audio system started successfully");
+        } else {
+            warn!("Real-time audio processor not available, running in compatibility mode");
+            // Fall back to legacy threading model if real-time audio fails
+            self.start_legacy_audio_threads();
+        }
+
+        // Start network processing thread (still using legacy approach for now)
         let network_clone = self.network_manager.clone();
-        let running_flag = Arc::new(Mutex::new(true));
+        let running_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let running_clone = running_flag.clone();
 
-        thread::spawn(move || {
-            Self::audio_capture_loop(audio_clone, network_clone, running_clone);
-        });
-
-        // Start network processing thread
-        let network_clone = self.network_manager.clone();
-        let running_clone = running_flag.clone();
         thread::spawn(move || {
             Self::network_processing_loop(network_clone, running_clone);
         });
@@ -72,31 +100,41 @@ impl VocalCommunicationApp {
         Ok(())
     }
 
-    fn audio_capture_loop(
+    /// Legacy audio threading for fallback compatibility
+    fn start_legacy_audio_threads(&self) {
+        warn!("Starting legacy audio threads (fallback mode)");
+
+        let audio_clone = self.audio_processor.clone();
+        let network_clone = self.network_manager.clone();
+        let running_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running_clone = running_flag.clone();
+
+        thread::spawn(move || {
+            Self::legacy_audio_capture_loop(audio_clone, network_clone, running_clone);
+        });
+    }
+
+    fn legacy_audio_capture_loop(
         audio_processor: Arc<Mutex<AudioProcessor>>,
         network_manager: Arc<Mutex<NetworkManager>>,
-        running: Arc<Mutex<bool>>
+        running: Arc<std::sync::atomic::AtomicBool>
     ) {
-        // THIS IS A STUB - Real implementation would:
-        // 1. Initialize CPAL audio stream
-        // 2. Capture audio frames from microphone
-        // 3. Process with noise cancellation/compression
-        // 4. Send processed frames to network manager
+        warn!("Running legacy audio capture loop (fallback mode)");
 
         let mut frame_counter = 0;
-        while *running.lock().unwrap() {
+        while running.load(std::sync::atomic::Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(20)); // ~50fps audio frames
 
-            // ASSUMPTION: Simulating audio capture for proof of concept
+            // LEGACY: Simulating audio capture for proof of concept
             let dummy_audio_frame = vec![0u8; 1024]; // 1KB frame
 
             if let (Ok(_processor), Ok(mut network)) =
                 (audio_processor.lock(), network_manager.lock()) {
 
-                // THIS IS A STUB - Process audio frame
+                // LEGACY STUB - Process audio frame
                 // processor.process_audio_frame(&input_samples, &mut output_samples);
 
-                // THIS IS A STUB - Send to network
+                // LEGACY STUB - Send to network
                 if network.is_connected() {
                     let _ = network.send_audio_frame(&dummy_audio_frame);
                 }
@@ -104,21 +142,19 @@ impl VocalCommunicationApp {
 
             frame_counter += 1;
             if frame_counter % 250 == 0 { // Every ~5 seconds
-                println!("Audio capture running... (frame {})", frame_counter);
+                info!("Legacy audio capture running... (frame {})", frame_counter);
             }
         }
+        warn!("Legacy audio capture loop stopped");
     }
 
     fn network_processing_loop(
         network_manager: Arc<Mutex<NetworkManager>>,
-        running: Arc<Mutex<bool>>
+        running: Arc<std::sync::atomic::AtomicBool>
     ) {
-        // THIS IS A STUB - Real implementation would:
-        // 1. Receive audio frames from network
-        // 2. Decode/decompress audio data
-        // 3. Queue for audio output/playback
+        info!("Network processing loop started");
 
-        while *running.lock().unwrap() {
+        while running.load(std::sync::atomic::Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(10));
 
             if let Ok(network) = network_manager.lock() {
@@ -128,22 +164,42 @@ impl VocalCommunicationApp {
                         Ok(audio_data) => {
                             if !audio_data.is_empty() {
                                 // THIS IS A STUB - Would queue for audio playback
-                                println!("Received audio frame: {} bytes", audio_data.len());
+                                // In Phase 2, this will integrate with the real-time audio processor
+                                if log::log_enabled!(log::Level::Debug) {
+                                    info!("Received audio frame: {} bytes", audio_data.len());
+                                }
                             }
                         }
                         Err(e) => {
-                            eprintln!("Network receive error: {}", e);
+                            error!("Network receive error: {}", e);
                             break;
                         }
                     }
                 }
             }
         }
+        info!("Network processing loop stopped");
     }
 
     pub fn stop(&mut self) {
+        info!("Stopping voice communication app...");
         self.is_running = false;
-        println!("Stopping voice communication app...");
+
+        // Stop real-time audio processor
+        if let Some(ref mut realtime_audio) = self.realtime_audio {
+            if let Err(e) = realtime_audio.stop() {
+                error!("Error stopping real-time audio processor: {}", e);
+            } else {
+                info!("Real-time audio processor stopped successfully");
+            }
+        }
+
+        info!("Voice communication app stopped");
+    }
+
+    /// Get real-time audio statistics for monitoring
+    pub fn get_audio_stats(&self) -> Option<crate::realtime_audio::AudioStats> {
+        self.realtime_audio.as_ref().map(|processor| processor.get_stats())
     }
 
     pub async fn connect_to_peer(&self, host: &str, port: u16) -> Result<()> {

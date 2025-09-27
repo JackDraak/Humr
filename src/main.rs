@@ -1,4 +1,7 @@
 mod audio;
+mod realtime_audio;
+mod jitter_buffer;
+mod opus_codec;
 mod network;
 mod ui;
 mod app;

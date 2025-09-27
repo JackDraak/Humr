@@ -8,6 +8,15 @@ tokio = { version = "1.0", features = ["full"] }
 cpal = "0.15"
 hound = "3.5"
 anyhow = "1.0"
+
+# Real-time audio processing dependencies
+ringbuf = "0.4"           # Lock-free ring buffers for audio
+dasp = "0.11"             # Digital audio signal processing
+rubato = "0.15"           # Sample rate conversion
+
+# Audio codecs and processing (Phase 1.2)
+audiopus = "0.3.0-rc.0"   # Rust Opus bindings for high-quality compression
+
 # Cryptographic dependencies for secure communication
 ring = "0.17"
 x25519-dalek = "2.0"
@@ -18,3 +27,9 @@ rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
+
+# Utility dependencies
+log = "0.4"               # Logging infrastructure
+env_logger = "0.11"       # Environment-based logging configuration
+crossbeam = "0.8"         # Lock-free data structures and utilities
+libc = "0.2"              # Low-level C library bindings for thread scheduling
