@@ -65,7 +65,7 @@ pub struct NoiseSuppressionProcessor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum GateState {
+pub enum GateState {
     Open,
     Closed,
     Attack,

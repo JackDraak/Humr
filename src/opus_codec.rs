@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use log::{info, warn, error};
 use audiopus::{coder::Encoder, coder::Decoder, Channels, Application, SampleRate, Bitrate};
-use crate::realtime_audio::{AudioFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE_SAMPLES};
+use crate::realtime_audio::{AudioFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE_SAMPLES, FRAME_SIZE_SAMPLES_PER_CHANNEL};
 
 /// Opus codec configuration for voice communication
 #[derive(Debug, Clone)]
@@ -18,9 +18,15 @@ pub struct OpusConfig {
     pub frame_duration_ms: u32,
     /// Complexity (0-10, higher = better quality but more CPU)
     pub complexity: u32,
+    /// Frame size in milliseconds
+    pub frame_size_ms: u32,
+    /// Forward Error Correction enabled
+    pub fec_enabled: bool,
+    /// Discontinuous Transmission enabled
+    pub dtx_enabled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpusApplication {
     VoIP,
     Audio,
@@ -36,7 +42,32 @@ impl Default for OpusConfig {
             application: OpusApplication::VoIP,
             frame_duration_ms: 20,  // 20ms frames (matches AudioFrame)
             complexity: 5,   // Balanced complexity
+            frame_size_ms: 20,
+            fec_enabled: true,  // Enable FEC for better error resilience
+            dtx_enabled: false, // Disable DTX for consistent quality
         }
+    }
+}
+
+impl OpusConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<()> {
+        if self.sample_rate != SAMPLE_RATE {
+            return Err(anyhow!("Sample rate must be {}", SAMPLE_RATE));
+        }
+        if self.channels != CHANNELS {
+            return Err(anyhow!("Channels must be {}", CHANNELS));
+        }
+        if self.bitrate < 6000 || self.bitrate > 510000 {
+            return Err(anyhow!("Bitrate must be between 6000 and 510000"));
+        }
+        if self.complexity > 10 {
+            return Err(anyhow!("Complexity must be <= 10"));
+        }
+        if ![10, 20, 40, 60].contains(&self.frame_duration_ms) {
+            return Err(anyhow!("Frame duration must be 10, 20, 40, or 60 ms"));
+        }
+        Ok(())
     }
 }
 
@@ -47,6 +78,11 @@ pub struct OpusCodec {
     decoder: Decoder,
     encoded_buffer: Vec<u8>,
     decoded_buffer_i16: Vec<i16>,
+    frames_encoded: u64,
+    frames_decoded: u64,
+    encoding_errors: u64,
+    decoding_errors: u64,
+    total_bytes_encoded: u64,
 }
 
 impl OpusCodec {
@@ -108,7 +144,7 @@ impl OpusCodec {
 
         // Pre-allocate buffers
         let max_encoded_size = 4000; // Opus max packet size
-        let decoded_buffer_size = FRAME_SIZE_SAMPLES * config.channels as usize;
+        let decoded_buffer_size = FRAME_SIZE_SAMPLES; // Already includes both channels
 
         info!("Opus codec created successfully");
 
@@ -118,6 +154,11 @@ impl OpusCodec {
             decoder,
             encoded_buffer: vec![0u8; max_encoded_size],
             decoded_buffer_i16: vec![0i16; decoded_buffer_size],
+            frames_encoded: 0,
+            frames_decoded: 0,
+            encoding_errors: 0,
+            decoding_errors: 0,
+            total_bytes_encoded: 0,
         })
     }
 
@@ -135,10 +176,13 @@ impl OpusCodec {
         // Encode with Opus
         match self.encoder.encode(&i16_samples, &mut self.encoded_buffer) {
             Ok(encoded_len) => {
+                self.frames_encoded += 1;
+                self.total_bytes_encoded += encoded_len as u64;
                 // Return only the used portion of the buffer
                 Ok(self.encoded_buffer[..encoded_len].to_vec())
             }
             Err(e) => {
+                self.encoding_errors += 1;
                 error!("Opus encoding failed: {}", e);
                 Err(anyhow!("Opus encoding failed: {}", e))
             }
@@ -159,25 +203,33 @@ impl OpusCodec {
 
         // Decode with Opus
         let decoded_len = match self.decoder.decode(Some(packet), signals, false) {
-            Ok(len) => len,
+            Ok(len) => {
+                self.frames_decoded += 1;
+                len
+            },
             Err(e) => {
+                self.decoding_errors += 1;
                 error!("Opus decoding failed: {}", e);
                 return Err(anyhow!("Opus decoding failed: {}", e));
             }
         };
 
-        // Verify we got the expected number of samples
-        let expected_samples = FRAME_SIZE_SAMPLES * self.config.channels as usize;
+        // Verify we got the expected number of samples (Opus returns samples per channel)
+        let expected_samples = FRAME_SIZE_SAMPLES_PER_CHANNEL;
         if decoded_len != expected_samples {
             warn!("Opus decoded {} samples, expected {}", decoded_len, expected_samples);
         }
 
         // Convert i16 samples back to f32 and create AudioFrame
-        let mut frame = AudioFrame::new();
-        for (i, &i16_sample) in self.decoded_buffer_i16[..decoded_len.min(frame.samples.len())].iter().enumerate() {
+        // decoded_len is samples per channel, but the buffer contains interleaved samples
+        // So for stereo, we need decoded_len * channels total samples
+        let total_samples = decoded_len * self.config.channels as usize;
+        let mut f32_samples = Vec::with_capacity(total_samples);
+        for &i16_sample in self.decoded_buffer_i16[..total_samples].iter() {
             // Convert from i16 range back to f32 range
-            frame.samples[i] = i16_sample as f32 / 32767.0;
+            f32_samples.push(i16_sample as f32 / 32767.0);
         }
+        let mut frame = AudioFrame::new(f32_samples);
 
         // Set frame metadata
         frame.timestamp = std::time::SystemTime::now()
@@ -207,11 +259,13 @@ impl OpusCodec {
             }
         };
 
-        // Convert to AudioFrame
-        let mut frame = AudioFrame::new();
-        for (i, &i16_sample) in self.decoded_buffer_i16[..decoded_len.min(frame.samples.len())].iter().enumerate() {
-            frame.samples[i] = i16_sample as f32 / 32767.0;
+        // Convert i16 samples back to f32 and create AudioFrame
+        let mut f32_samples = Vec::with_capacity(decoded_len);
+        for &i16_sample in self.decoded_buffer_i16[..decoded_len].iter() {
+            // Convert from i16 range back to f32 range
+            f32_samples.push(i16_sample as f32 / 32767.0);
         }
+        let mut frame = AudioFrame::new(f32_samples);
 
         frame.timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -255,12 +309,25 @@ impl OpusCodec {
 
     /// Get codec statistics
     pub fn get_stats(&self) -> OpusStats {
+        let average_compression_ratio = if self.frames_encoded > 0 {
+            let uncompressed_bytes = self.frames_encoded * FRAME_SIZE_SAMPLES as u64 * 4; // 4 bytes per f32
+            uncompressed_bytes as f64 / self.total_bytes_encoded as f64
+        } else {
+            0.0
+        };
+
         OpusStats {
             sample_rate: self.config.sample_rate,
             channels: self.config.channels,
             bitrate: self.config.bitrate,
             complexity: self.config.complexity,
             frame_duration_ms: self.config.frame_duration_ms,
+            frames_encoded: self.frames_encoded,
+            frames_decoded: self.frames_decoded,
+            encoding_errors: self.encoding_errors,
+            decoding_errors: self.decoding_errors,
+            total_bytes_encoded: self.total_bytes_encoded,
+            average_compression_ratio,
         }
     }
 
@@ -321,6 +388,12 @@ pub struct OpusStats {
     pub bitrate: u32,
     pub complexity: u32,
     pub frame_duration_ms: u32,
+    pub frames_encoded: u64,
+    pub frames_decoded: u64,
+    pub encoding_errors: u64,
+    pub decoding_errors: u64,
+    pub total_bytes_encoded: u64,
+    pub average_compression_ratio: f64,
 }
 
 impl OpusStats {

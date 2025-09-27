@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod noise_suppression_tests {
-    use super::super::noise_suppression::*;
-    use super::super::realtime_audio::{AudioFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE_SAMPLES};
+    use crate::noise_suppression::*;
+    use crate::realtime_audio::{AudioFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE_SAMPLES};
     use std::collections::VecDeque;
 
     #[test]
@@ -473,7 +473,7 @@ mod noise_suppression_tests {
             return 100.0;
         }
 
-        10.0 * (signal_power / noise_power).log10()
+        10.0_f32 * (signal_power / noise_power).log10()
     }
 
     fn calculate_rms(samples: &[f32]) -> f32 {

@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod jitter_buffer_tests {
-    use super::super::jitter_buffer::*;
-    use super::super::realtime_audio::AudioFrame;
+    use crate::jitter_buffer::*;
+    use crate::jitter_buffer::{AdaptiveJitterBuffer, AudioPacket};
+    use crate::realtime_audio::AudioFrame;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -25,7 +26,7 @@ mod jitter_buffer_tests {
         assert!(buffer.is_ok());
         let buffer = buffer.unwrap();
 
-        assert_eq!(buffer.get_config(), &config);
+        assert_eq!(buffer.get_config(), config);
         assert_eq!(buffer.size(), 0);
         assert!(buffer.is_empty());
         assert_eq!(buffer.current_target_size(), config.initial_target_size);
@@ -54,7 +55,7 @@ mod jitter_buffer_tests {
         // Add packets in sequence
         for i in 0..5 {
             let frame = AudioFrame::new(vec![i as f32; 100]);
-            let packet = AudioPacket::new(frame, i * 1000, i);
+            let packet = AudioPacket::new(frame, i * 1000, i as u32);
             buffer.add_packet(packet).unwrap();
         }
 
@@ -62,11 +63,15 @@ mod jitter_buffer_tests {
 
         // Retrieve packets - should come out in order
         for i in 0..5 {
+            println!("Getting packet {}, buffer size: {}", i, buffer.size());
             let packet = buffer.get_next_packet();
-            assert!(packet.is_some());
+            if packet.is_none() {
+                println!("No packet returned for sequence {}", i);
+            }
+            assert!(packet.is_some(), "Expected packet for sequence {}", i);
             let packet = packet.unwrap();
             assert_eq!(packet.sequence_number, i);
-            assert_eq!(packet.timestamp, i * 1000);
+            assert_eq!(packet.timestamp, i as u64 * 1000);
         }
 
         assert!(buffer.is_empty());
@@ -81,7 +86,7 @@ mod jitter_buffer_tests {
         let sequences = vec![2, 0, 3, 1, 4];
         for &seq in &sequences {
             let frame = AudioFrame::new(vec![seq as f32; 100]);
-            let packet = AudioPacket::new(frame, seq * 1000, seq);
+            let packet = AudioPacket::new(frame, seq as u64 * 1000, seq as u32);
             buffer.add_packet(packet).unwrap();
         }
 
@@ -91,7 +96,7 @@ mod jitter_buffer_tests {
         for expected_seq in 0..5 {
             let packet = buffer.get_next_packet();
             assert!(packet.is_some());
-            assert_eq!(packet.unwrap().sequence_number, expected_seq);
+            assert_eq!(packet.unwrap().sequence_number, expected_seq as u32);
         }
     }
 
@@ -166,7 +171,7 @@ mod jitter_buffer_tests {
         // Add more packets than max_size
         for i in 0..10 {
             let frame = AudioFrame::new(vec![i as f32; 100]);
-            let packet = AudioPacket::new(frame, i * 1000, i);
+            let packet = AudioPacket::new(frame, i * 1000, i as u32);
             buffer.add_packet(packet).unwrap();
         }
 
@@ -230,7 +235,7 @@ mod jitter_buffer_tests {
         // Add some packets
         for i in 0..5 {
             let frame = AudioFrame::new(vec![i as f32; 100]);
-            let packet = AudioPacket::new(frame, i * 1000, i);
+            let packet = AudioPacket::new(frame, i * 1000, i as u32);
             buffer.add_packet(packet).unwrap();
         }
 
@@ -282,13 +287,13 @@ mod jitter_buffer_tests {
         let config = JitterBufferConfig::default();
         let buffer = Arc::new(Mutex::new(AdaptiveJitterBuffer::new(config).unwrap()));
 
-        let buffer_clone = Arc::clone(&buffer);
+        let buffer_clone: Arc<Mutex<AdaptiveJitterBuffer>> = Arc::clone(&buffer);
 
         // Producer thread
         let producer = thread::spawn(move || {
             for i in 0..100 {
                 let frame = AudioFrame::new(vec![i as f32; 50]);
-                let packet = AudioPacket::new(frame, i * 1000, i);
+                let packet = AudioPacket::new(frame, i * 1000, i as u32);
 
                 let mut buf = buffer_clone.lock().unwrap();
                 let _ = buf.add_packet(packet);
@@ -302,7 +307,7 @@ mod jitter_buffer_tests {
         });
 
         // Consumer thread
-        let buffer_clone2 = Arc::clone(&buffer);
+        let buffer_clone2: Arc<Mutex<AdaptiveJitterBuffer>> = Arc::clone(&buffer);
         let consumer = thread::spawn(move || {
             let mut packets_received = 0;
 
@@ -336,7 +341,7 @@ mod jitter_buffer_tests {
         let sequences = vec![0, 1, 3, 4];
         for &seq in &sequences {
             let frame = AudioFrame::new(vec![seq as f32; 100]);
-            let packet = AudioPacket::new(frame, seq * 1000, seq);
+            let packet = AudioPacket::new(frame, seq as u64 * 1000, seq as u32);
             buffer.add_packet(packet).unwrap();
         }
 
@@ -387,7 +392,31 @@ mod jitter_buffer_tests {
 }
 
 // Extension methods for testing
-impl AdaptiveJitterBuffer {
+impl crate::jitter_buffer::AdaptiveJitterBuffer {
+    pub fn add_packet(&mut self, packet: crate::jitter_buffer::AudioPacket) -> Result<(), anyhow::Error> {
+        self.put_packet(packet)
+    }
+
+    pub fn get_next_packet(&mut self) -> Option<crate::jitter_buffer::AudioPacket> {
+        let result = self.get_next_sequential_packet();
+        if let Some(ref packet) = result {
+            // Update expected sequence like the real get_frame method does
+            self.expected_sequence = packet.sequence_number.wrapping_add(1);
+        }
+        result
+    }
+
+    pub fn size(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn current_target_size(&self) -> usize {
+        self.current_target_size
+    }
     pub fn simulate_network_delay(&mut self, delay_ms: f64) {
         self.network_delay_samples.push_back(delay_ms);
         if self.network_delay_samples.len() > 50 {
@@ -408,10 +437,11 @@ impl AdaptiveJitterBuffer {
 
     pub fn check_adaptation(&mut self) {
         // Force adaptation check for testing
-        let now = Instant::now();
-        if now.duration_since(self.last_adaptation_time) > Duration::from_secs(1) {
-            self.adapt_target_size();
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_adaptation_time) > std::time::Duration::from_secs(1) {
+            self.adapt_buffer_size();
             self.last_adaptation_time = now;
         }
     }
+
 }

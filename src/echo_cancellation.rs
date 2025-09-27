@@ -382,6 +382,13 @@ impl EchoCancellationProcessor {
         (1.0 - (error_variance * 1000.0).min(1.0)).max(0.0)
     }
 
+    /// Add audio frame for processing (convenience method)
+    pub fn add_frame(&mut self, frame: &crate::realtime_audio::AudioFrame) {
+        // This is a convenience method that could be used for buffering frames
+        // For now, it's a no-op since the main processing happens in process_frame
+        self.frames_processed += 1;
+    }
+
     /// Reset processor state
     pub fn reset(&mut self) {
         info!("Resetting echo cancellation processor");

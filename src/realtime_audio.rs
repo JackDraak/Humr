@@ -1,14 +1,18 @@
 use anyhow::{Result, anyhow};
 use log::{info, error, warn};
 use ringbuf::{HeapRb, traits::*};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use cpal::{Device, Stream, StreamConfig, SampleRate, BufferSize};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-/// Audio frame size in samples (20ms at 48kHz = 960 samples)
-pub const FRAME_SIZE_SAMPLES: usize = 960;
+/// Audio frame size in samples per channel (20ms at 48kHz = 960 samples per channel)
+pub const FRAME_SIZE_SAMPLES_PER_CHANNEL: usize = 960;
+/// Total samples for stereo frame
+pub const FRAME_SIZE_SAMPLES: usize = FRAME_SIZE_SAMPLES_PER_CHANNEL * CHANNELS as usize;
+/// Frame duration in milliseconds
+pub const FRAME_SIZE_MS: u32 = 20;
 /// Audio sample rate (48kHz for high quality)
 pub const SAMPLE_RATE: u32 = 48000;
 /// Audio channels (stereo)
@@ -19,7 +23,7 @@ pub const RING_BUFFER_CAPACITY: usize = FRAME_SIZE_SAMPLES * 25;
 /// Real-time safe audio frame container
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
-    pub samples: [f32; FRAME_SIZE_SAMPLES * CHANNELS as usize],
+    pub samples: Vec<f32>,
     pub timestamp: u64,
     pub sequence: u32,
 }
@@ -43,7 +47,7 @@ impl ZeroCopyAudioBuffer {
         let mut frame_pool = Vec::with_capacity(capacity);
         for i in 0..capacity {
             frame_pool.push(AudioFrame {
-                samples: [0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize],
+                samples: vec![0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize],
                 timestamp: 0,
                 sequence: i as u32,
             });
@@ -127,20 +131,28 @@ impl ZeroCopyBufferStats {
 }
 
 impl AudioFrame {
-    pub fn new() -> Self {
+    pub fn new(samples: Vec<f32>) -> Self {
         Self {
-            samples: [0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize],
+            samples,
+            timestamp: 0,
+            sequence: 0,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            samples: vec![0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize],
             timestamp: 0,
             sequence: 0,
         }
     }
 
     pub fn silence() -> Self {
-        Self::new()
+        Self::empty()
     }
 
     pub fn len(&self) -> usize {
-        FRAME_SIZE_SAMPLES * CHANNELS as usize
+        self.samples.len()
     }
 
     pub fn channels(&self) -> u16 {
@@ -338,7 +350,7 @@ impl RealTimeAudioProcessor {
         frames_processed: &std::sync::atomic::AtomicU64,
         last_input_time: &std::sync::atomic::AtomicU64,
     ) {
-        let mut frame = AudioFrame::new();
+        let mut frame = AudioFrame::empty();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -489,7 +501,58 @@ impl RealTimeAudioProcessor {
             input_buffer_usage: 0, // TODO: Implement via shared atomic counters if needed
             output_buffer_usage: 0, // TODO: Implement via shared atomic counters if needed
             is_running: self.is_running.load(Ordering::Relaxed),
+            input_underruns: 0, // TODO: Implement underrun tracking
+            output_overruns: 0, // TODO: Implement overrun tracking
         }
+    }
+
+    /// Check if processor is currently running
+    pub fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::Relaxed)
+    }
+
+    /// Start async processing
+    pub async fn start_processing(&mut self) -> Result<()> {
+        if self.is_running() {
+            return Err(anyhow!("Audio processor is already running"));
+        }
+
+        self.initialize()?;
+        self.start()?;
+        Ok(())
+    }
+
+    /// Stop async processing
+    pub async fn stop_processing(&mut self) -> Result<()> {
+        if !self.is_running() {
+            return Err(anyhow!("Audio processor is not running"));
+        }
+
+        self.stop()?;
+        Ok(())
+    }
+
+    /// Set sample rate (validate range)
+    pub fn set_sample_rate(&mut self, sample_rate: u32) -> Result<()> {
+        match sample_rate {
+            8000 | 16000 | 22050 | 44100 | 48000 | 88200 | 96000 => {
+                // Valid sample rates - would need to reinitialize streams
+                Ok(())
+            }
+            _ => Err(anyhow!("Unsupported sample rate: {}", sample_rate))
+        }
+    }
+
+    /// Set buffer size (validate power of 2 and range)
+    pub fn set_buffer_size(&mut self, buffer_size: u32) -> Result<()> {
+        if !buffer_size.is_power_of_two() {
+            return Err(anyhow!("Buffer size must be power of 2"));
+        }
+        if buffer_size < 64 || buffer_size > 4096 {
+            return Err(anyhow!("Buffer size must be between 64 and 4096"));
+        }
+        // Valid buffer size - would need to reinitialize streams
+        Ok(())
     }
 }
 
@@ -501,6 +564,83 @@ impl Drop for RealTimeAudioProcessor {
     }
 }
 
+/// Audio buffer pool for efficient memory management
+pub struct AudioBufferPool {
+    capacity: usize,
+    available: Arc<Mutex<Vec<Vec<f32>>>>,
+}
+
+impl AudioBufferPool {
+    /// Create new buffer pool with given capacity
+    pub fn new(capacity: usize) -> Self {
+        let mut buffers = Vec::new();
+        for _ in 0..capacity {
+            buffers.push(vec![0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize]);
+        }
+
+        Self {
+            capacity,
+            available: Arc::new(Mutex::new(buffers)),
+        }
+    }
+
+    /// Get number of total buffers in pool
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Get number of available buffers
+    pub fn available(&self) -> usize {
+        self.available.lock().unwrap().len()
+    }
+
+    /// Get number of allocated buffers
+    pub fn allocated(&self) -> usize {
+        self.capacity - self.available()
+    }
+
+    /// Acquire a buffer from the pool
+    pub fn acquire(&self) -> Option<Vec<f32>> {
+        self.available.lock().unwrap().pop()
+    }
+
+    /// Clear all buffers (force release)
+    pub fn clear(&self) {
+        let mut available = self.available.lock().unwrap();
+        available.clear();
+        for _ in 0..self.capacity {
+            available.push(vec![0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize]);
+        }
+    }
+}
+
+/// Set real-time thread priority for low-latency audio processing
+pub fn set_realtime_priority() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use libc::{sched_setscheduler, sched_param, SCHED_FIFO};
+        let param = sched_param { sched_priority: 80 };
+        let result = unsafe { sched_setscheduler(0, SCHED_FIFO, &param) };
+        if result != 0 {
+            return Err(anyhow!("Failed to set real-time priority"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS uses different thread priority APIs
+        warn!("Real-time priority setting not implemented for macOS");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows uses different thread priority APIs
+        warn!("Real-time priority setting not implemented for Windows");
+    }
+
+    Ok(())
+}
+
 /// Audio processing statistics
 #[derive(Debug, Clone)]
 pub struct AudioStats {
@@ -510,6 +650,8 @@ pub struct AudioStats {
     pub input_buffer_usage: usize,
     pub output_buffer_usage: usize,
     pub is_running: bool,
+    pub input_underruns: u64,
+    pub output_overruns: u64,
 }
 
 impl AudioStats {

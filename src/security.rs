@@ -7,6 +7,50 @@ use rand::rngs::OsRng;
 use serde::{Serialize, Deserialize};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
+/// Security error types
+#[derive(Debug)]
+pub enum SecurityError {
+    KeyGeneration(String),
+    EncryptionFailed(String),
+    DecryptionFailed(String),
+    SignatureFailed(String),
+    VerificationFailed(String),
+    InvalidMessage(String),
+    SessionNotEstablished,
+    KeyDerivationFailed,
+    InvalidSignature,
+    UntrustedPeer,
+    InvalidHandshake,
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SecurityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecurityError::KeyGeneration(msg) => write!(f, "Key generation error: {}", msg),
+            SecurityError::EncryptionFailed(msg) => write!(f, "Encryption failed: {}", msg),
+            SecurityError::DecryptionFailed(msg) => write!(f, "Decryption failed: {}", msg),
+            SecurityError::SignatureFailed(msg) => write!(f, "Signature failed: {}", msg),
+            SecurityError::VerificationFailed(msg) => write!(f, "Verification failed: {}", msg),
+            SecurityError::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
+            SecurityError::SessionNotEstablished => write!(f, "Session not established"),
+            SecurityError::KeyDerivationFailed => write!(f, "Key derivation failed"),
+            SecurityError::InvalidSignature => write!(f, "Invalid signature"),
+            SecurityError::UntrustedPeer => write!(f, "Untrusted peer"),
+            SecurityError::InvalidHandshake => write!(f, "Invalid handshake"),
+            SecurityError::Other(err) => write!(f, "Security error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for SecurityError {}
+
+impl From<anyhow::Error> for SecurityError {
+    fn from(err: anyhow::Error) -> Self {
+        SecurityError::Other(err)
+    }
+}
+
 /// Security configuration for the voice communication system
 #[derive(Clone)]
 pub struct SecurityConfig {
@@ -25,7 +69,7 @@ pub struct SecurityConfig {
 
 impl SecurityConfig {
     /// Create new security configuration with fresh identity
-    pub fn new() -> Result<Self> {
+    pub fn new() -> Result<Self, SecurityError> {
         let identity_signing_key = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
         let identity_verifying_key = identity_signing_key.verifying_key();
 
@@ -116,7 +160,7 @@ pub enum SecureMessage {
 /// Secure session manager for end-to-end encrypted communication
 pub struct SecureSession {
     config: SecurityConfig,
-    peer_identity: Option<VerifyingKey>,
+    pub(crate) peer_identity: Option<VerifyingKey>,
     shared_secret: Option<SharedSecret>,
     ephemeral_secret: Option<EphemeralSecret>,
     session_key: Option<[u8; 32]>,
@@ -367,11 +411,22 @@ impl SecureSession {
 
     /// Derive session key from shared secret and peer identity
     fn derive_session_key(&self, shared_secret: &SharedSecret, peer_identity: &VerifyingKey) -> Result<[u8; 32]> {
-        // HKDF-like key derivation
+        // HKDF-like key derivation with consistent ordering
         let mut hasher = Sha256::new();
         hasher.update(shared_secret.as_bytes());
-        hasher.update(self.config.identity_verifying_key.as_bytes());
-        hasher.update(peer_identity.as_bytes());
+
+        // Ensure both parties derive the same key by ordering identities consistently
+        let self_bytes = self.config.identity_verifying_key.as_bytes();
+        let peer_bytes = peer_identity.as_bytes();
+
+        if self_bytes < peer_bytes {
+            hasher.update(self_bytes);
+            hasher.update(peer_bytes);
+        } else {
+            hasher.update(peer_bytes);
+            hasher.update(self_bytes);
+        }
+
         hasher.update(b"HUMR_SESSION_KEY_V1");
 
         let hash = hasher.finalize();
@@ -386,5 +441,240 @@ impl SecureSession {
     /// Get peer's verified identity
     pub fn get_peer_identity(&self) -> Option<&VerifyingKey> {
         self.peer_identity.as_ref()
+    }
+}
+
+/// High-level security manager for the tests
+pub struct SecurityManager {
+    session: SecureSession,
+    config: SecurityConfig,
+    stats: SecurityStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecurityStats {
+    pub messages_encrypted: u64,
+    pub messages_decrypted: u64,
+    pub audio_frames_encrypted: u64,
+    pub audio_frames_decrypted: u64,
+    pub key_exchanges_initiated: u64,
+    pub key_exchanges_completed: u64,
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KeyExchangeMessage {
+    pub ephemeral_public_key: Vec<u8>,
+    pub identity_public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub timestamp: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EncryptedMessage {
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub tag: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EncryptedAudioFrame {
+    pub encrypted_data: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub frame_number: u64,
+}
+
+impl SecurityManager {
+    pub fn new(config: SecurityConfig) -> Result<Self, SecurityError> {
+        let session = SecureSession::new(config.clone());
+        let stats = SecurityStats {
+            messages_encrypted: 0,
+            messages_decrypted: 0,
+            audio_frames_encrypted: 0,
+            audio_frames_decrypted: 0,
+            key_exchanges_initiated: 0,
+            key_exchanges_completed: 0,
+        };
+
+        Ok(Self {
+            session,
+            config,
+            stats,
+        })
+    }
+
+    pub fn has_established_session(&self) -> bool {
+        self.session.is_session_active()
+    }
+
+    pub fn get_identity_key(&self) -> VerifyingKey {
+        self.config.identity_verifying_key
+    }
+
+    pub fn add_trusted_key(&mut self, key: VerifyingKey) -> Result<(), SecurityError> {
+        self.config.trusted_keys.push(key);
+        Ok(())
+    }
+
+    pub fn remove_trusted_key(&mut self, key: &VerifyingKey) {
+        self.config.trusted_keys.retain(|k| k != key);
+    }
+
+    pub fn is_key_trusted(&self, key: &VerifyingKey) -> bool {
+        self.config.trusted_keys.contains(key)
+    }
+
+    pub fn initiate_key_exchange(&mut self) -> Result<KeyExchangeMessage, SecurityError> {
+        self.stats.key_exchanges_initiated += 1;
+
+        let handshake = self.session.initiate_handshake()
+            .map_err(|_| SecurityError::KeyDerivationFailed)?;
+
+        match handshake {
+            SecureMessage::Handshake { ephemeral_public_key, identity_public_key, signature, timestamp } => {
+                Ok(KeyExchangeMessage {
+                    ephemeral_public_key: BASE64.decode(ephemeral_public_key).unwrap(),
+                    identity_public_key: BASE64.decode(identity_public_key).unwrap(),
+                    signature: BASE64.decode(signature).unwrap(),
+                    timestamp,
+                })
+            }
+            _ => Err(SecurityError::InvalidHandshake),
+        }
+    }
+
+    pub fn process_key_exchange(&mut self, exchange: &KeyExchangeMessage) -> Result<KeyExchangeMessage, SecurityError> {
+        let handshake = SecureMessage::Handshake {
+            ephemeral_public_key: BASE64.encode(&exchange.ephemeral_public_key),
+            identity_public_key: BASE64.encode(&exchange.identity_public_key),
+            signature: BASE64.encode(&exchange.signature),
+            timestamp: exchange.timestamp,
+        };
+
+        let response = self.session.process_handshake(handshake)
+            .map_err(|_| SecurityError::InvalidHandshake)?;
+
+        match response {
+            Some(SecureMessage::HandshakeResponse { ephemeral_public_key, signature, timestamp }) => {
+                Ok(KeyExchangeMessage {
+                    ephemeral_public_key: BASE64.decode(ephemeral_public_key).unwrap(),
+                    identity_public_key: self.config.identity_verifying_key.as_bytes().to_vec(),
+                    signature: BASE64.decode(signature).unwrap(),
+                    timestamp,
+                })
+            }
+            _ => Err(SecurityError::InvalidHandshake),
+        }
+    }
+
+    pub fn complete_key_exchange(&mut self, response: &KeyExchangeMessage) -> Result<(), SecurityError> {
+        // Extract and verify peer identity from response
+        let peer_identity_array: [u8; 32] = response.identity_public_key.as_slice()
+            .try_into()
+            .map_err(|_| SecurityError::InvalidHandshake)?;
+        let peer_identity = VerifyingKey::from_bytes(&peer_identity_array)
+            .map_err(|_| SecurityError::InvalidHandshake)?;
+
+        // Store peer identity in session for handshake response processing
+        self.session.peer_identity = Some(peer_identity);
+
+        let handshake_response = SecureMessage::HandshakeResponse {
+            ephemeral_public_key: BASE64.encode(&response.ephemeral_public_key),
+            signature: BASE64.encode(&response.signature),
+            timestamp: response.timestamp,
+        };
+
+        self.session.process_handshake_response(handshake_response)
+            .map_err(|_| SecurityError::InvalidHandshake)?;
+
+        self.stats.key_exchanges_completed += 1;
+        Ok(())
+    }
+
+    pub fn encrypt_message(&mut self, data: &[u8]) -> Result<EncryptedMessage, SecurityError> {
+        self.stats.messages_encrypted += 1;
+
+        let encrypted = self.session.encrypt_audio_frame(data)
+            .map_err(|e| SecurityError::EncryptionFailed(e.to_string()))?;
+
+        match encrypted {
+            SecureMessage::EncryptedAudio { nonce, ciphertext, .. } => {
+                Ok(EncryptedMessage {
+                    ciphertext: BASE64.decode(ciphertext).unwrap(),
+                    nonce: BASE64.decode(nonce).unwrap(),
+                    tag: vec![], // ChaCha20Poly1305 includes auth tag in ciphertext
+                })
+            }
+            _ => Err(SecurityError::EncryptionFailed("Unexpected message type".to_string())),
+        }
+    }
+
+    pub fn decrypt_message(&mut self, encrypted: &EncryptedMessage) -> Result<Vec<u8>, SecurityError> {
+        self.stats.messages_decrypted += 1;
+
+        let message = SecureMessage::EncryptedAudio {
+            nonce: BASE64.encode(&encrypted.nonce),
+            ciphertext: BASE64.encode(&encrypted.ciphertext),
+            frame_number: 0,
+        };
+
+        self.session.decrypt_audio_frame(message)
+            .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))
+    }
+
+    pub fn encrypt_audio_frame(&mut self, frame: &crate::realtime_audio::AudioFrame) -> Result<EncryptedAudioFrame, SecurityError> {
+        self.stats.audio_frames_encrypted += 1;
+
+        // Convert audio frame to bytes
+        let mut audio_bytes = Vec::new();
+        for &sample in &frame.samples {
+            audio_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let encrypted = self.session.encrypt_audio_frame(&audio_bytes)
+            .map_err(|e| SecurityError::EncryptionFailed(e.to_string()))?;
+
+        match encrypted {
+            SecureMessage::EncryptedAudio { nonce, ciphertext, frame_number } => {
+                Ok(EncryptedAudioFrame {
+                    encrypted_data: BASE64.decode(ciphertext).unwrap(),
+                    nonce: BASE64.decode(nonce).unwrap(),
+                    frame_number,
+                })
+            }
+            _ => Err(SecurityError::EncryptionFailed("Unexpected message type".to_string())),
+        }
+    }
+
+    pub fn decrypt_audio_frame(&mut self, encrypted: &EncryptedAudioFrame) -> Result<crate::realtime_audio::AudioFrame, SecurityError> {
+        self.stats.audio_frames_decrypted += 1;
+
+        let message = SecureMessage::EncryptedAudio {
+            nonce: BASE64.encode(&encrypted.nonce),
+            ciphertext: BASE64.encode(&encrypted.encrypted_data),
+            frame_number: encrypted.frame_number,
+        };
+
+        let audio_bytes = self.session.decrypt_audio_frame(message)
+            .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))?;
+
+        // Convert bytes back to audio frame
+        let mut samples = Vec::new();
+        for chunk in audio_bytes.chunks_exact(4) {
+            let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            samples.push(sample);
+        }
+
+        Ok(crate::realtime_audio::AudioFrame::new(samples))
+    }
+
+    pub fn rotate_session_keys(&mut self) -> Result<(), SecurityError> {
+        // For testing - create a new session
+        self.session = SecureSession::new(self.config.clone());
+        Ok(())
+    }
+
+    pub fn get_stats(&self) -> &SecurityStats {
+        &self.stats
     }
 }

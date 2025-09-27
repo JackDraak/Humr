@@ -33,3 +33,8 @@ log = "0.4"               # Logging infrastructure
 env_logger = "0.11"       # Environment-based logging configuration
 crossbeam = "0.8"         # Lock-free data structures and utilities
 libc = "0.2"              # Low-level C library bindings for thread scheduling
+hkdf = "0.12"             # HMAC-based Key Derivation Function
+
+[lib]
+name = "humr"
+path = "src/lib.rs"
