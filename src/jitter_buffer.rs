@@ -63,10 +63,10 @@ pub struct AdaptiveJitterBuffer {
     pub(crate) buffer: VecDeque<AudioPacket>,
     pub(crate) expected_sequence: u32,
     last_played_timestamp: u64,
-    buffer_underruns: u64,
-    buffer_overruns: u64,
-    late_packets: u64,
-    duplicate_packets: u64,
+    pub(crate) buffer_underruns: u64,
+    pub(crate) buffer_overruns: u64,
+    pub(crate) late_packets: u64,
+    pub(crate) duplicate_packets: u64,
 
     // Adaptive parameters
     pub(crate) current_target_size: usize,
@@ -102,22 +102,23 @@ impl AdaptiveJitterBuffer {
 
     /// Add incoming audio packet to buffer
     pub fn put_packet(&mut self, packet: AudioPacket) -> Result<()> {
-        // Check for duplicate packets
-        if packet.sequence_number < self.expected_sequence {
-            self.duplicate_packets += 1;
-            debug!("Dropping duplicate packet: seq={}, expected={}",
-                   packet.sequence_number, self.expected_sequence);
-            return Ok(());
+        // Check for duplicate packets (packet already in buffer)
+        for existing in &self.buffer {
+            if existing.sequence_number == packet.sequence_number {
+                self.duplicate_packets += 1;
+                debug!("Dropping duplicate packet: seq={}", packet.sequence_number);
+                return Ok(());
+            }
         }
 
         // Calculate network delay for adaptation
         self.update_delay_statistics(&packet);
 
-        // Check if packet is too late
-        if self.is_packet_too_late(&packet) {
+        // Check if packet is too late (either time-based or sequence-based)
+        if self.is_packet_too_late(&packet) || packet.sequence_number < self.expected_sequence {
             self.late_packets += 1;
-            debug!("Dropping late packet: seq={}, delay={}ms",
-                   packet.sequence_number,
+            debug!("Dropping late packet: seq={}, expected={}, delay={}ms",
+                   packet.sequence_number, self.expected_sequence,
                    packet.arrival_time.elapsed().as_millis());
             return Ok(());
         }
@@ -308,6 +309,7 @@ impl AdaptiveJitterBuffer {
         self.average_delay = 0.0;
         self.delay_variance = 0.0;
     }
+
 }
 
 /// Jitter buffer statistics

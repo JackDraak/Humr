@@ -44,7 +44,7 @@ impl Default for OpusConfig {
             complexity: 5,   // Balanced complexity
             frame_size_ms: 20,
             fec_enabled: true,  // Enable FEC for better error resilience
-            dtx_enabled: false, // Disable DTX for consistent quality
+            dtx_enabled: true, // Enable DTX for efficient bandwidth usage
         }
     }
 }

@@ -131,14 +131,15 @@ mod jitter_buffer_tests {
 
         // Add a packet and immediately try to get it to advance expected sequence
         let frame1 = AudioFrame::new(vec![1.0; 100]);
-        let packet1 = AudioPacket::new(frame1, 1000, 1);
+        let packet1 = AudioPacket::new(frame1, 1000, 0);
         buffer.add_packet(packet1).unwrap();
-        buffer.get_next_packet(); // This advances expected_sequence to 2
+        let retrieved = buffer.get_next_packet(); // This advances expected_sequence to 1
+        assert!(retrieved.is_some(), "Should have retrieved packet 0");
 
         // Sleep to simulate late arrival
         std::thread::sleep(Duration::from_millis(150));
 
-        // Add a packet with sequence 0 (should be considered late)
+        // Add a packet with sequence 0 again (should be considered late since we already processed seq 0)
         let frame2 = AudioFrame::new(vec![2.0; 100]);
         let packet2 = AudioPacket::new(frame2, 500, 0);
         buffer.add_packet(packet2).unwrap();
@@ -402,6 +403,9 @@ impl crate::jitter_buffer::AdaptiveJitterBuffer {
         if let Some(ref packet) = result {
             // Update expected sequence like the real get_frame method does
             self.expected_sequence = packet.sequence_number.wrapping_add(1);
+        } else {
+            // Track underruns when no packet is available
+            self.buffer_underruns += 1;
         }
         result
     }
