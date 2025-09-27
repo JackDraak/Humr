@@ -52,21 +52,31 @@ impl Default for OpusConfig {
 impl OpusConfig {
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
-        if self.sample_rate != SAMPLE_RATE {
-            return Err(anyhow!("Sample rate must be {}", SAMPLE_RATE));
+        // Validate sample rate (Opus supports these rates)
+        if ![8000, 12000, 16000, 24000, 48000].contains(&self.sample_rate) {
+            return Err(anyhow!("Sample rate must be 8000, 12000, 16000, 24000, or 48000 Hz"));
         }
-        if self.channels != CHANNELS {
-            return Err(anyhow!("Channels must be {}", CHANNELS));
+
+        // Validate channels (Opus supports mono and stereo)
+        if self.channels < 1 || self.channels > 2 {
+            return Err(anyhow!("Channels must be 1 (mono) or 2 (stereo)"));
         }
-        if self.bitrate < 6000 || self.bitrate > 510000 {
-            return Err(anyhow!("Bitrate must be between 6000 and 510000"));
+
+        // Validate bitrate range for Opus
+        if self.bitrate < 6000 || self.bitrate > 512000 {
+            return Err(anyhow!("Bitrate must be between 6000 and 512000 bps"));
         }
+
+        // Validate complexity
         if self.complexity > 10 {
             return Err(anyhow!("Complexity must be <= 10"));
         }
-        if ![10, 20, 40, 60].contains(&self.frame_duration_ms) {
+
+        // Validate frame duration (Opus standard durations)
+        if ![10, 20, 40, 60].contains(&self.frame_size_ms) {
             return Err(anyhow!("Frame duration must be 10, 20, 40, or 60 ms"));
         }
+
         Ok(())
     }
 }
