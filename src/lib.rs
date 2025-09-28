@@ -9,6 +9,9 @@ pub mod ui;
 pub mod app;
 pub mod platform;
 pub mod security;
+pub mod config;
+pub mod monitoring;
+pub mod error_recovery;
 
 #[cfg(test)]
 pub mod tests;

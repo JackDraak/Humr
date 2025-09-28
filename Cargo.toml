@@ -35,6 +35,10 @@ crossbeam = "0.8"         # Lock-free data structures and utilities
 libc = "0.2"              # Low-level C library bindings for thread scheduling
 hkdf = "0.12"             # HMAC-based Key Derivation Function
 
+# Configuration management dependencies
+toml = "0.8"              # TOML parsing and serialization
+dirs = "5.0"              # Platform-specific directories
+
 [lib]
 name = "humr"
 path = "src/lib.rs"

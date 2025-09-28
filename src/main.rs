@@ -9,6 +9,9 @@ mod ui;
 mod app;
 mod platform;
 mod security;
+mod config;
+mod monitoring;
+mod error_recovery;
 
 use anyhow::Result;
 use app::VocalCommunicationApp;

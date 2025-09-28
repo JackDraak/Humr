@@ -5,3 +5,5 @@ mod noise_suppression_tests;
 mod echo_cancellation_tests;
 mod security_tests;
 mod integration_tests;
+mod cross_platform_tests;
+mod error_recovery_tests;
