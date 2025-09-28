@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, Mutex};
 use anyhow::{Result, anyhow};
 use serde_json;
 
@@ -10,10 +11,13 @@ use crate::security::{SecureSession, SecureMessage, SecurityConfig};
 pub struct NetworkManager {
     connection_config: ConnectionConfig,
     is_connected: bool,
-    tx_channel: mpsc::Sender<Vec<u8>>,
-    rx_channel: mpsc::Receiver<Vec<u8>>,
+    udp_socket: Option<Arc<UdpSocket>>,
+    peer_addr: Option<SocketAddr>,
+    // Async channels for UDP audio frames
+    audio_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    audio_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     // Security components
-    secure_session: Option<SecureSession>,
+    secure_session: Arc<Mutex<Option<SecureSession>>>,
     pending_handshake: bool,
 }
 
@@ -28,112 +32,121 @@ pub struct ConnectionConfig {
 
 impl NetworkManager {
     pub fn new(config: ConnectionConfig) -> Self {
-        let (tx, rx) = mpsc::channel();
-
         // Initialize secure session if security config provided
         let secure_session = if let Some(security_config) = config.security_config.clone() {
-            Some(SecureSession::new(security_config))
+            Arc::new(Mutex::new(Some(SecureSession::new(security_config))))
         } else {
-            None
+            Arc::new(Mutex::new(None))
         };
 
         Self {
             connection_config: config,
             is_connected: false,
-            tx_channel: tx,
-            rx_channel: rx,
+            udp_socket: None,
+            peer_addr: None,
+            audio_tx: None,
+            audio_rx: None,
             secure_session,
             pending_handshake: false,
         }
     }
 
-    /// Establish secure connection with peer authentication and key exchange
+    /// Establish UDP connection with peer
     pub async fn establish_connection(&mut self) -> Result<()> {
-        let addr = format!("{}:{}", self.connection_config.remote_host, self.connection_config.port);
+        let local_addr = format!("0.0.0.0:{}", self.connection_config.port);
+        let remote_addr = format!("{}:{}", self.connection_config.remote_host, self.connection_config.port);
 
         // Ensure we have security config if encryption is enabled
-        if self.connection_config.use_encryption && self.secure_session.is_none() {
-            return Err(anyhow!("Encryption enabled but no security configuration provided"));
+        {
+            let session_guard = self.secure_session.lock().await;
+            if self.connection_config.use_encryption && session_guard.is_none() {
+                return Err(anyhow!("Encryption enabled but no security configuration provided"));
+            }
         }
 
-        // ASSUMPTION: Try to connect as client first, fall back to server mode
-        match TcpStream::connect(&addr).await {
-            Ok(stream) => {
-                println!("Connected as client to {}", addr);
-                self.handle_connection(stream, true).await?;
-            }
-            Err(_) => {
-                println!("Failed to connect as client, starting server on port {}", self.connection_config.port);
-                self.start_server().await?;
-            }
+        // Bind UDP socket
+        let socket = UdpSocket::bind(&local_addr).await
+            .map_err(|e| anyhow!("Failed to bind UDP socket to {}: {}", local_addr, e))?;
+
+        println!("UDP socket bound to {}", local_addr);
+
+        // Parse remote address
+        let peer_addr: SocketAddr = remote_addr.parse()
+            .map_err(|e| anyhow!("Invalid remote address {}: {}", remote_addr, e))?;
+
+        // Store socket and peer address
+        let socket_arc = Arc::new(socket);
+        self.udp_socket = Some(Arc::clone(&socket_arc));
+        self.peer_addr = Some(peer_addr);
+
+        // Set up audio channels
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel();
+        self.audio_tx = Some(audio_tx);
+        self.audio_rx = Some(audio_rx);
+
+        // Start UDP receive loop
+        self.start_udp_receiver(socket_arc, peer_addr).await?;
+
+        // Perform handshake if encryption is enabled
+        if self.connection_config.use_encryption {
+            self.perform_udp_handshake(peer_addr).await?;
         }
 
         self.is_connected = true;
+        println!("UDP connection established with {}", peer_addr);
         Ok(())
     }
 
-    async fn start_server(&mut self) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.connection_config.port);
-        let listener = TcpListener::bind(&addr).await?;
-        println!("Server listening on {}", addr);
+    /// Start UDP receiver loop
+    async fn start_udp_receiver(&mut self, socket: Arc<UdpSocket>, _peer_addr: SocketAddr) -> Result<()> {
+        let audio_tx = self.audio_tx.as_ref()
+            .ok_or_else(|| anyhow!("Audio transmitter not initialized"))?
+            .clone();
+        let secure_session = Arc::clone(&self.secure_session);
 
-        // ASSUMPTION: Accept only one connection for peer-to-peer voice chat
-        let (stream, peer_addr) = listener.accept().await?;
-        println!("Accepted connection from {}", peer_addr);
-
-        self.handle_connection(stream, false).await?;
-        Ok(())
-    }
-
-    /// Handle secure connection with optional handshake initiation
-    async fn handle_connection(&mut self, mut stream: TcpStream, is_initiator: bool) -> Result<()> {
-        // If encryption is enabled, perform secure handshake
-        if self.connection_config.use_encryption {
-            self.perform_secure_handshake(&mut stream, is_initiator).await?;
-        }
-
-        let tx = self.tx_channel.clone();
-        let secure_session = self.secure_session.take(); // Move session into the task
-
-        // Spawn connection handler task
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; 8192]; // Increased buffer for encrypted messages
+            let mut buffer = vec![0u8; 2048]; // Smaller buffer for UDP packets
 
             loop {
-                match stream.read(&mut buffer).await {
-                    Ok(0) => break, // Connection closed
-                    Ok(n) => {
-                        let message_data = buffer[..n].to_vec();
+                match socket.recv_from(&mut buffer).await {
+                    Ok((len, _addr)) => {
+                        let packet_data = buffer[..len].to_vec();
 
-                        // If we have encryption, try to decrypt the message
-                        let audio_data = if let Some(ref session) = secure_session {
-                            // Parse as JSON message
-                            match serde_json::from_slice::<SecureMessage>(&message_data) {
-                                Ok(secure_msg) => {
-                                    match session.decrypt_audio_frame(secure_msg) {
-                                        Ok(decrypted) => decrypted,
-                                        Err(e) => {
-                                            eprintln!("Decryption failed: {}", e);
-                                            continue;
+                        // Try to decrypt if we have a secure session
+                        let audio_data = {
+                            let session_guard = secure_session.lock().await;
+                            if let Some(ref session) = *session_guard {
+                                // Try to parse as SecureMessage
+                                match serde_json::from_slice::<SecureMessage>(&packet_data) {
+                                    Ok(secure_msg) => {
+                                        match session.decrypt_audio_frame(secure_msg) {
+                                            Ok(decrypted) => decrypted,
+                                            Err(e) => {
+                                                eprintln!("Decryption failed: {}", e);
+                                                continue;
+                                            }
                                         }
                                     }
+                                    Err(_) => {
+                                        // Assume plaintext for development/fallback
+                                        packet_data
+                                    }
                                 }
-                                Err(_) => {
-                                    // Might be plaintext - accept for now
-                                    // ASSUMPTION: For graceful degradation during development
-                                    message_data
-                                }
+                            } else {
+                                // No encryption, use raw data
+                                packet_data
                             }
-                        } else {
-                            // No encryption, use raw data
-                            message_data
                         };
 
-                        if tx.send(audio_data).is_err() {
-                            break; // Channel closed
+                        if audio_tx.send(audio_data).is_err() {
+                            eprintln!("Audio channel closed, stopping UDP receiver");
+                            break;
                         }
                     }
-                    Err(_) => break, // Connection error
+                    Err(e) => {
+                        eprintln!("UDP receive error: {}", e);
+                        break;
+                    }
                 }
             }
         });
@@ -141,42 +154,46 @@ impl NetworkManager {
         Ok(())
     }
 
-    /// Perform secure handshake with peer
-    async fn perform_secure_handshake(&mut self, stream: &mut TcpStream, is_initiator: bool) -> Result<()> {
-        let session = self.secure_session.as_mut()
-            .ok_or_else(|| anyhow!("No secure session available"))?;
+    /// Perform secure handshake over UDP
+    async fn perform_udp_handshake(&mut self, peer_addr: SocketAddr) -> Result<()> {
+        let socket = self.udp_socket.as_ref()
+            .ok_or_else(|| anyhow!("No UDP socket available"))?;
 
-        if is_initiator {
-            // Initiate handshake
-            println!("Initiating secure handshake...");
-            let handshake_msg = session.initiate_handshake()?;
-            let handshake_json = serde_json::to_vec(&handshake_msg)?;
+        // We'll act as initiator for simplicity
+        println!("Initiating secure UDP handshake with {}", peer_addr);
 
-            // Send handshake
-            stream.write_all(&handshake_json).await?;
+        let handshake_msg = {
+            let mut session_guard = self.secure_session.lock().await;
+            let session = session_guard.as_mut()
+                .ok_or_else(|| anyhow!("No secure session available"))?;
+            session.initiate_handshake()?
+        };
 
-            // Wait for response
-            let mut buffer = vec![0u8; 4096];
-            let n = stream.read(&mut buffer).await?;
-            let response_msg: SecureMessage = serde_json::from_slice(&buffer[..n])?;
+        let handshake_json = serde_json::to_vec(&handshake_msg)?;
 
-            // Process response
-            session.process_handshake_response(response_msg)?;
-            println!("Secure handshake completed (initiator)");
+        // Send handshake packet
+        socket.send_to(&handshake_json, peer_addr).await?;
 
-        } else {
-            // Wait for handshake
-            println!("Waiting for secure handshake...");
-            let mut buffer = vec![0u8; 4096];
-            let n = stream.read(&mut buffer).await?;
-            let handshake_msg: SecureMessage = serde_json::from_slice(&buffer[..n])?;
+        // Wait for response with timeout
+        let mut buffer = vec![0u8; 4096];
+        let response_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.recv_from(&mut buffer)
+        ).await;
 
-            // Process and respond
-            if let Some(response) = session.process_handshake(handshake_msg)? {
-                let response_json = serde_json::to_vec(&response)?;
-                stream.write_all(&response_json).await?;
-                println!("Secure handshake completed (responder)");
+        match response_result {
+            Ok(Ok((len, _))) => {
+                let response_msg: SecureMessage = serde_json::from_slice(&buffer[..len])?;
+
+                let mut session_guard = self.secure_session.lock().await;
+                let session = session_guard.as_mut()
+                    .ok_or_else(|| anyhow!("No secure session available"))?;
+                session.process_handshake_response(response_msg)?;
+
+                println!("Secure UDP handshake completed");
             }
+            Ok(Err(e)) => return Err(anyhow!("UDP receive error during handshake: {}", e)),
+            Err(_) => return Err(anyhow!("Handshake timeout - peer may not be ready")),
         }
 
         self.pending_handshake = false;
@@ -185,22 +202,31 @@ impl NetworkManager {
 
     pub fn disconnect(&mut self) {
         self.is_connected = false;
-        // ASSUMPTION: Connection cleanup would happen here
+        self.udp_socket = None;
+        self.peer_addr = None;
+        self.audio_tx = None;
+        self.audio_rx = None;
     }
 
     pub fn is_connected(&self) -> bool {
         self.is_connected
     }
 
-    /// Send encrypted audio frame to peer
-    pub fn send_audio_frame(&mut self, frame_data: &[u8]) -> Result<()> {
+    /// Send audio frame over UDP
+    pub async fn send_audio_frame(&self, frame_data: &[u8]) -> Result<()> {
         if !self.is_connected {
             return Err(anyhow!("Not connected"));
         }
 
+        let socket = self.udp_socket.as_ref()
+            .ok_or_else(|| anyhow!("No UDP socket available"))?;
+        let peer_addr = self.peer_addr
+            .ok_or_else(|| anyhow!("No peer address set"))?;
+
         // If encryption is enabled, encrypt the frame
         let data_to_send = if self.connection_config.use_encryption {
-            if let Some(ref mut session) = self.secure_session {
+            let mut session_guard = self.secure_session.lock().await;
+            if let Some(ref mut session) = *session_guard {
                 if session.is_session_active() {
                     // Encrypt the audio frame
                     let encrypted_msg = session.encrypt_audio_frame(frame_data)?;
@@ -216,17 +242,22 @@ impl NetworkManager {
             frame_data.to_vec()
         };
 
-        // ASSUMPTION: For now, just put data in channel
-        // Real implementation would send over TCP stream with proper framing
-        self.tx_channel.send(data_to_send)?;
+        // Send UDP packet directly
+        socket.send_to(&data_to_send, peer_addr).await
+            .map_err(|e| anyhow!("Failed to send UDP packet: {}", e))?;
+
         Ok(())
     }
 
-    pub fn receive_audio_frame(&self) -> Result<Vec<u8>> {
-        match self.rx_channel.try_recv() {
-            Ok(data) => Ok(data),
-            Err(mpsc::TryRecvError::Empty) => Ok(vec![]),
-            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("Connection closed")),
+    pub fn receive_audio_frame(&mut self) -> Result<Vec<u8>> {
+        if let Some(ref mut audio_rx) = self.audio_rx {
+            match audio_rx.try_recv() {
+                Ok(data) => Ok(data),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(vec![]),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(anyhow!("Audio channel closed")),
+            }
+        } else {
+            Err(anyhow!("No audio receiver available"))
         }
     }
 
@@ -236,24 +267,27 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub fn update_config(&mut self, config: ConnectionConfig) {
+    pub async fn update_config(&mut self, config: ConnectionConfig) {
         // Update security session if config changed
         if let Some(security_config) = config.security_config.clone() {
-            self.secure_session = Some(SecureSession::new(security_config));
+            let mut session_guard = self.secure_session.lock().await;
+            *session_guard = Some(SecureSession::new(security_config));
         }
         self.connection_config = config;
     }
 
     /// Get peer's verified identity (if secure session is active)
-    pub fn get_peer_identity(&self) -> Option<String> {
-        self.secure_session.as_ref()
+    pub async fn get_peer_identity(&self) -> Option<String> {
+        let session_guard = self.secure_session.lock().await;
+        session_guard.as_ref()
             .and_then(|session| session.get_peer_identity())
             .map(|pk| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pk.as_bytes()))
     }
 
     /// Check if secure session is active
-    pub fn is_secure_session_active(&self) -> bool {
-        self.secure_session.as_ref()
+    pub async fn is_secure_session_active(&self) -> bool {
+        let session_guard = self.secure_session.lock().await;
+        session_guard.as_ref()
             .map(|session| session.is_session_active())
             .unwrap_or(false)
     }

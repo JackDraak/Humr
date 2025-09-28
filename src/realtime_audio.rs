@@ -591,7 +591,7 @@ impl AudioBufferPool {
 
     /// Get number of available buffers
     pub fn available(&self) -> usize {
-        self.available.lock().unwrap().len()
+        self.available.lock().map(|guard| guard.len()).unwrap_or(0)
     }
 
     /// Get number of allocated buffers
@@ -601,15 +601,16 @@ impl AudioBufferPool {
 
     /// Acquire a buffer from the pool
     pub fn acquire(&self) -> Option<Vec<f32>> {
-        self.available.lock().unwrap().pop()
+        self.available.lock().ok()?.pop()
     }
 
     /// Clear all buffers (force release)
     pub fn clear(&self) {
-        let mut available = self.available.lock().unwrap();
-        available.clear();
-        for _ in 0..self.capacity {
-            available.push(vec![0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize]);
+        if let Ok(mut available) = self.available.lock() {
+            available.clear();
+            for _ in 0..self.capacity {
+                available.push(vec![0.0; FRAME_SIZE_SAMPLES * CHANNELS as usize]);
+            }
         }
     }
 }

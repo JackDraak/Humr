@@ -533,9 +533,12 @@ impl SecurityManager {
         match handshake {
             SecureMessage::Handshake { ephemeral_public_key, identity_public_key, signature, timestamp } => {
                 Ok(KeyExchangeMessage {
-                    ephemeral_public_key: BASE64.decode(ephemeral_public_key).unwrap(),
-                    identity_public_key: BASE64.decode(identity_public_key).unwrap(),
-                    signature: BASE64.decode(signature).unwrap(),
+                    ephemeral_public_key: BASE64.decode(ephemeral_public_key)
+                        .map_err(|_| SecurityError::InvalidHandshake)?,
+                    identity_public_key: BASE64.decode(identity_public_key)
+                        .map_err(|_| SecurityError::InvalidHandshake)?,
+                    signature: BASE64.decode(signature)
+                        .map_err(|_| SecurityError::InvalidHandshake)?,
                     timestamp,
                 })
             }
@@ -557,9 +560,11 @@ impl SecurityManager {
         match response {
             Some(SecureMessage::HandshakeResponse { ephemeral_public_key, signature, timestamp }) => {
                 Ok(KeyExchangeMessage {
-                    ephemeral_public_key: BASE64.decode(ephemeral_public_key).unwrap(),
+                    ephemeral_public_key: BASE64.decode(ephemeral_public_key)
+                        .map_err(|_| SecurityError::InvalidHandshake)?,
                     identity_public_key: self.config.identity_verifying_key.as_bytes().to_vec(),
-                    signature: BASE64.decode(signature).unwrap(),
+                    signature: BASE64.decode(signature)
+                        .map_err(|_| SecurityError::InvalidHandshake)?,
                     timestamp,
                 })
             }
@@ -600,8 +605,10 @@ impl SecurityManager {
         match encrypted {
             SecureMessage::EncryptedAudio { nonce, ciphertext, .. } => {
                 Ok(EncryptedMessage {
-                    ciphertext: BASE64.decode(ciphertext).unwrap(),
-                    nonce: BASE64.decode(nonce).unwrap(),
+                    ciphertext: BASE64.decode(ciphertext)
+                        .map_err(|_| SecurityError::EncryptionFailed("Base64 decode failed".to_string()))?,
+                    nonce: BASE64.decode(nonce)
+                        .map_err(|_| SecurityError::EncryptionFailed("Base64 decode failed".to_string()))?,
                     tag: vec![], // ChaCha20Poly1305 includes auth tag in ciphertext
                 })
             }
@@ -637,8 +644,10 @@ impl SecurityManager {
         match encrypted {
             SecureMessage::EncryptedAudio { nonce, ciphertext, frame_number } => {
                 Ok(EncryptedAudioFrame {
-                    encrypted_data: BASE64.decode(ciphertext).unwrap(),
-                    nonce: BASE64.decode(nonce).unwrap(),
+                    encrypted_data: BASE64.decode(ciphertext)
+                        .map_err(|_| SecurityError::EncryptionFailed("Base64 decode failed".to_string()))?,
+                    nonce: BASE64.decode(nonce)
+                        .map_err(|_| SecurityError::EncryptionFailed("Base64 decode failed".to_string()))?,
                     frame_number,
                 })
             }

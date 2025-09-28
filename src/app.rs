@@ -157,7 +157,7 @@ impl VocalCommunicationApp {
         while running.load(std::sync::atomic::Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(10));
 
-            if let Ok(network) = network_manager.lock() {
+            if let Ok(mut network) = network_manager.lock() {
                 if network.is_connected() {
                     // THIS IS A STUB - Receive and process network audio
                     match network.receive_audio_frame() {
