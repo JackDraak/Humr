@@ -6,6 +6,7 @@ use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use serde::{Serialize, Deserialize};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use std::collections::HashSet;
 
 /// Security error types
 #[derive(Debug)]
@@ -449,6 +450,7 @@ pub struct SecurityManager {
     session: SecureSession,
     config: SecurityConfig,
     stats: SecurityStats,
+    used_nonces: HashSet<Vec<u8>>, // Track used nonces to prevent replay attacks
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +502,7 @@ impl SecurityManager {
             session,
             config,
             stats,
+            used_nonces: HashSet::new(),
         })
     }
 
@@ -599,24 +602,38 @@ impl SecurityManager {
     pub fn encrypt_message(&mut self, data: &[u8]) -> Result<EncryptedMessage, SecurityError> {
         self.stats.messages_encrypted += 1;
 
-        let encrypted = self.session.encrypt_audio_frame(data)
-            .map_err(|e| SecurityError::EncryptionFailed(e.to_string()))?;
+        // Get the session cipher directly for better performance
+        let cipher = self.session.config.session_cipher.as_ref()
+            .ok_or(SecurityError::SessionNotEstablished)?;
 
-        match encrypted {
-            SecureMessage::EncryptedAudio { nonce, ciphertext, .. } => {
-                Ok(EncryptedMessage {
-                    ciphertext: BASE64.decode(ciphertext)
-                        .map_err(|_| SecurityError::EncryptionFailed("Base64 decode failed".to_string()))?,
-                    nonce: BASE64.decode(nonce)
-                        .map_err(|_| SecurityError::EncryptionFailed("Base64 decode failed".to_string()))?,
-                    tag: vec![], // ChaCha20Poly1305 includes auth tag in ciphertext
-                })
-            }
-            _ => Err(SecurityError::EncryptionFailed("Unexpected message type".to_string())),
-        }
+        // Use frame counter for nonce generation (faster than OsRng for bulk operations)
+        self.session.frame_counter += 1;
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..].copy_from_slice(&self.session.frame_counter.to_le_bytes());
+
+        // Include session generation counter to ensure nonces differ across key rotations
+        let session_gen = self.stats.key_exchanges_completed; // Use as session identifier
+        nonce_bytes[0..4].copy_from_slice(&(session_gen as u32).to_le_bytes());
+
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // Encrypt directly without base64 encoding/decoding
+        let ciphertext = cipher.encrypt(nonce, data)
+            .map_err(|_| SecurityError::EncryptionFailed("Encryption failed".to_string()))?;
+
+        Ok(EncryptedMessage {
+            ciphertext,
+            nonce: nonce.as_slice().to_vec(),
+            tag: vec![], // ChaCha20Poly1305 includes auth tag in ciphertext
+        })
     }
 
     pub fn decrypt_message(&mut self, encrypted: &EncryptedMessage) -> Result<Vec<u8>, SecurityError> {
+        // Check for nonce reuse (replay attack protection)
+        if self.used_nonces.contains(&encrypted.nonce) {
+            return Err(SecurityError::DecryptionFailed("Nonce reuse detected (replay attack)".to_string()));
+        }
+
         self.stats.messages_decrypted += 1;
 
         let message = SecureMessage::EncryptedAudio {
@@ -625,8 +642,15 @@ impl SecurityManager {
             frame_number: 0,
         };
 
-        self.session.decrypt_audio_frame(message)
-            .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))
+        let result = self.session.decrypt_audio_frame(message)
+            .map_err(|e| SecurityError::DecryptionFailed(e.to_string()));
+
+        // Only add nonce to used set if decryption was successful
+        if result.is_ok() {
+            self.used_nonces.insert(encrypted.nonce.clone());
+        }
+
+        result
     }
 
     pub fn encrypt_audio_frame(&mut self, frame: &crate::realtime_audio::AudioFrame) -> Result<EncryptedAudioFrame, SecurityError> {
@@ -656,6 +680,11 @@ impl SecurityManager {
     }
 
     pub fn decrypt_audio_frame(&mut self, encrypted: &EncryptedAudioFrame) -> Result<crate::realtime_audio::AudioFrame, SecurityError> {
+        // Check for nonce reuse (replay attack protection)
+        if self.used_nonces.contains(&encrypted.nonce) {
+            return Err(SecurityError::DecryptionFailed("Nonce reuse detected (replay attack)".to_string()));
+        }
+
         self.stats.audio_frames_decrypted += 1;
 
         let message = SecureMessage::EncryptedAudio {
@@ -666,6 +695,9 @@ impl SecurityManager {
 
         let audio_bytes = self.session.decrypt_audio_frame(message)
             .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))?;
+
+        // Only add nonce to used set if decryption was successful
+        self.used_nonces.insert(encrypted.nonce.clone());
 
         // Convert bytes back to audio frame
         let mut samples = Vec::new();
@@ -678,9 +710,36 @@ impl SecurityManager {
     }
 
     pub fn rotate_session_keys(&mut self) -> Result<(), SecurityError> {
-        // For testing - create a new session
-        self.session = SecureSession::new(self.config.clone());
-        Ok(())
+        // Proper key rotation: generate new session key while preserving session state
+        if !self.session.is_session_active() {
+            return Err(SecurityError::SessionNotEstablished);
+        }
+
+        // Generate new session key using existing shared secret and peer identity
+        if let (Some(shared_secret), Some(peer_identity)) =
+            (&self.session.shared_secret, &self.session.peer_identity) {
+
+            // Derive new session key with incremented frame counter for uniqueness
+            self.session.frame_counter += 1;
+            let new_key = self.session.derive_session_key(shared_secret, peer_identity)?;
+
+            // Create new cipher with rotated key
+            let new_cipher = ChaCha20Poly1305::new(Key::from_slice(&new_key));
+            self.session.config.session_cipher = Some(new_cipher);
+
+            // Reset frame counter for new session
+            self.session.frame_counter = 0;
+
+            // Clear used nonces since they're not relevant to the new session
+            self.used_nonces.clear();
+
+            // Increment key rotation counter for nonce uniqueness
+            self.stats.key_exchanges_completed += 1;
+
+            Ok(())
+        } else {
+            Err(SecurityError::SessionNotEstablished)
+        }
     }
 
     pub fn get_stats(&self) -> &SecurityStats {

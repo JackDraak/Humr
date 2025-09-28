@@ -275,8 +275,37 @@ impl EchoCancellationProcessor {
         let mic_power: f32 = microphone.iter().map(|&x| x.powi(2)).sum::<f32>() / microphone.len() as f32;
         let echo_power: f32 = self.estimated_echo.iter().map(|&x| x.powi(2)).sum::<f32>() / self.estimated_echo.len() as f32;
 
-        // Determine if echo is present
-        self.echo_detected = echo_power > self.config.echo_threshold * mic_power;
+        // Also check for direct correlation between recent reference and microphone signals
+        let correlation_detected = if self.reference_buffer.len() >= microphone.len() {
+            let recent_ref: Vec<f32> = self.reference_buffer.iter()
+                .rev()
+                .take(microphone.len())
+                .copied()
+                .collect();
+
+            if recent_ref.len() == microphone.len() {
+                // Simple correlation check
+                let correlation: f32 = recent_ref.iter()
+                    .zip(microphone.iter())
+                    .map(|(&r, &m)| r * m)
+                    .sum();
+                let ref_power: f32 = recent_ref.iter().map(|&x| x.powi(2)).sum();
+
+                if ref_power > 1e-10 && mic_power > 1e-10 {
+                    let normalized_correlation = correlation / (ref_power.sqrt() * mic_power.sqrt());
+                    normalized_correlation.abs() > 0.3 // Threshold for correlation-based detection
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Determine if echo is present (either from adaptive filter estimate or correlation)
+        self.echo_detected = echo_power > self.config.echo_threshold * mic_power || correlation_detected;
 
         if self.echo_detected {
             // Calculate suppression factor
@@ -328,9 +357,11 @@ impl EchoCancellationProcessor {
             // Apply suppression
             *sample *= self.nonlinear_suppression;
 
-            // Add comfort noise to mask artifacts
-            let noise = (rand::random::<f32>() - 0.5) * self.comfort_noise_level;
-            *sample += noise;
+            // Add comfort noise only when there's significant suppression to mask artifacts
+            if self.nonlinear_suppression < 0.5 {
+                let noise = (rand::random::<f32>() - 0.5) * self.comfort_noise_level * 0.1; // Reduce comfort noise level
+                *sample += noise;
+            }
         }
     }
 
