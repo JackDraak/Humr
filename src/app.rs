@@ -207,7 +207,7 @@ impl VocalCommunicationApp {
             // LEGACY: Simulating audio capture for proof of concept
             let dummy_audio_frame = vec![0u8; 1024]; // 1KB frame
 
-            if let (Ok(_processor), Ok(mut network)) =
+            if let (Ok(_processor), Ok(network)) =
                 (audio_processor.lock(), network_manager.lock()) {
 
                 // LEGACY STUB - Process audio frame
@@ -345,8 +345,8 @@ impl VocalCommunicationApp {
         }
 
         // Update network configuration
-        if let Ok(mut network) = self.network_manager.lock() {
-            let connection_config = config.to_connection_config();
+        if let Ok(_network) = self.network_manager.lock() {
+            let _connection_config = config.to_connection_config();
             // Note: In a real implementation, you'd have an update_config method on NetworkManager
             warn!("Network configuration update not yet implemented");
         }

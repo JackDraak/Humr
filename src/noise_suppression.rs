@@ -62,6 +62,9 @@ pub struct NoiseSuppressionProcessor {
     // Statistics
     frames_processed: u64,
     noise_reduction_applied: f32,
+
+    // Gain smoothing
+    last_gain: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +112,7 @@ impl NoiseSuppressionProcessor {
             gate_state: GateState::Closed,
             frames_processed: 0,
             noise_reduction_applied: 0.0,
+            last_gain: 1.0,
         })
     }
 
@@ -154,21 +158,42 @@ impl NoiseSuppressionProcessor {
         let is_likely_noise = rms < 0.1 &&
                               high_freq_energy > mid_freq_energy; // Noise often has high-freq content
 
-        // Apply adaptive suppression
-        let attenuation = if is_likely_speech {
-            // Preserve speech with minimal processing
-            0.98 - (self.config.strength * 0.1)
+        // Improved adaptive suppression with speech preservation focus
+        let base_attenuation = if is_likely_speech {
+            // Preserve speech with minimal processing - much more conservative
+            1.0 - (self.config.strength * 0.05).min(0.1)  // Max 10% reduction for speech
         } else if is_likely_noise {
             // More aggressive suppression for detected noise
-            1.0 - (self.config.strength * 0.8)
+            1.0 - (self.config.strength * 0.7).min(0.8)   // Max 80% reduction for noise
         } else {
-            // Moderate suppression for uncertain signals
-            1.0 - (self.config.strength * 0.6)
+            // Moderate suppression for uncertain signals - be conservative
+            1.0 - (self.config.strength * 0.3).min(0.4)   // Max 40% reduction for uncertain
         };
 
-        // Apply smoothed gain to avoid artifacts
-        for sample in samples {
-            *sample *= attenuation;
+        // Apply gain smoothing to prevent artifacts and preserve transients
+        let target_gain = base_attenuation;
+        let smoothing_factor = if is_likely_speech { 0.95 } else { 0.85 }; // Slower changes for speech
+
+        // First pass: detect transients
+        let mut transients = vec![false; samples.len()];
+        for i in 1..samples.len() {
+            transients[i] = (samples[i].abs() - samples[i-1].abs()).abs() > 0.1;
+        }
+
+        // Second pass: apply gain with transient preservation
+        for (i, sample) in samples.iter_mut().enumerate() {
+            let is_transient = transients[i];
+
+            let gain = if is_transient && is_likely_speech {
+                // Don't suppress transients in speech regions
+                1.0
+            } else {
+                // Smooth gain changes
+                self.last_gain * smoothing_factor + target_gain * (1.0 - smoothing_factor)
+            };
+
+            *sample *= gain;
+            self.last_gain = gain;
         }
 
         // Update gate state for stats
@@ -307,7 +332,7 @@ impl NoiseSuppressionProcessor {
         }
 
         // Process in overlapping frames
-        let mut output_samples: Vec<f32> = Vec::new();
+        let _output_samples: Vec<f32> = Vec::new();
 
         while self.input_buffer.len() >= self.fft_size {
             // Extract frame for processing

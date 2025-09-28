@@ -414,7 +414,7 @@ impl EchoCancellationProcessor {
     }
 
     /// Add audio frame for processing (convenience method)
-    pub fn add_frame(&mut self, frame: &crate::realtime_audio::AudioFrame) {
+    pub fn add_frame(&mut self, _frame: &crate::realtime_audio::AudioFrame) {
         // This is a convenience method that could be used for buffering frames
         // For now, it's a no-op since the main processing happens in process_frame
         self.frames_processed += 1;

@@ -208,7 +208,7 @@ impl OpusCodec {
             .map_err(|e| anyhow!("Failed to create Opus packet: {}", e))?;
 
         // Create mutable signals wrapper for i16 buffer
-        let mut signals = MutSignals::try_from(&mut self.decoded_buffer_i16[..])
+        let signals = MutSignals::try_from(&mut self.decoded_buffer_i16[..])
             .map_err(|e| anyhow!("Failed to create signals wrapper: {}", e))?;
 
         // Decode with Opus
@@ -257,7 +257,7 @@ impl OpusCodec {
         info!("Generating packet loss concealment frame");
 
         // Create mutable signals wrapper for i16 buffer
-        let mut signals = MutSignals::try_from(&mut self.decoded_buffer_i16[..])
+        let signals = MutSignals::try_from(&mut self.decoded_buffer_i16[..])
             .map_err(|e| anyhow!("Failed to create signals wrapper: {}", e))?;
 
         // Opus can generate concealment for lost packets

@@ -1,12 +1,71 @@
 use anyhow::{Result, anyhow};
 use log::{info, error, warn};
 use ringbuf::{HeapRb, traits::*};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use cpal::{Device, Stream, StreamConfig, SampleRate, BufferSize};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+/// Runtime configurable audio parameters
+#[derive(Debug, Clone)]
+pub struct AudioConfiguration {
+    /// Audio sample rate (default: 48kHz for high quality)
+    pub sample_rate: u32,
+    /// Audio channels (default: stereo)
+    pub channels: u16,
+    /// Frame duration in milliseconds (default: 20ms)
+    pub frame_duration_ms: u32,
+    /// Ring buffer capacity multiplier (default: 25 for ~500ms of audio)
+    pub buffer_capacity_multiplier: usize,
+}
+
+impl Default for AudioConfiguration {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48000,
+            channels: 2,
+            frame_duration_ms: 20,
+            buffer_capacity_multiplier: 25,
+        }
+    }
+}
+
+impl AudioConfiguration {
+    /// Calculate frame size in samples per channel based on sample rate and duration
+    pub fn frame_size_samples_per_channel(&self) -> usize {
+        (self.sample_rate as f32 * (self.frame_duration_ms as f32 / 1000.0)) as usize
+    }
+
+    /// Calculate total frame size in samples (all channels)
+    pub fn frame_size_samples(&self) -> usize {
+        self.frame_size_samples_per_channel() * self.channels as usize
+    }
+
+    /// Calculate ring buffer capacity based on frame size and multiplier
+    pub fn ring_buffer_capacity(&self) -> usize {
+        self.frame_size_samples() * self.buffer_capacity_multiplier
+    }
+
+    /// Validate the configuration parameters
+    pub fn validate(&self) -> Result<()> {
+        if self.sample_rate < 8000 || self.sample_rate > 192000 {
+            return Err(anyhow!("Sample rate must be between 8kHz and 192kHz"));
+        }
+        if self.channels == 0 || self.channels > 8 {
+            return Err(anyhow!("Channels must be between 1 and 8"));
+        }
+        if self.frame_duration_ms == 0 || self.frame_duration_ms > 100 {
+            return Err(anyhow!("Frame duration must be between 1ms and 100ms"));
+        }
+        if self.buffer_capacity_multiplier == 0 || self.buffer_capacity_multiplier > 1000 {
+            return Err(anyhow!("Buffer capacity multiplier must be between 1 and 1000"));
+        }
+        Ok(())
+    }
+}
+
+/// Legacy constants for backward compatibility (use AudioConfiguration instead)
 /// Audio frame size in samples per channel (20ms at 48kHz = 960 samples per channel)
 pub const FRAME_SIZE_SAMPLES_PER_CHANNEL: usize = 960;
 /// Total samples for stereo frame
@@ -166,6 +225,9 @@ impl AudioFrame {
 
 /// Real-time audio processor with lock-free architecture
 pub struct RealTimeAudioProcessor {
+    // Audio configuration
+    config: AudioConfiguration,
+
     // Audio device streams
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
@@ -183,17 +245,31 @@ pub struct RealTimeAudioProcessor {
     last_input_time: Arc<std::sync::atomic::AtomicU64>,
     last_output_time: Arc<std::sync::atomic::AtomicU64>,
 
+    // Buffer usage tracking (shared with processing thread)
+    input_buffer_usage: Arc<AtomicU64>,
+    output_buffer_usage: Arc<AtomicU64>,
+    input_underruns: Arc<AtomicU64>,
+    output_overruns: Arc<AtomicU64>,
+
     // Ring buffer handles for processing thread
     input_consumer: Option<ringbuf::HeapCons<AudioFrame>>,
     output_producer: Option<ringbuf::HeapProd<AudioFrame>>,
 }
 
 impl RealTimeAudioProcessor {
-    /// Create new real-time audio processor
+    /// Create new real-time audio processor with default configuration
     pub fn new() -> Result<Self> {
-        info!("Initializing real-time audio processor");
+        Self::with_config(AudioConfiguration::default())
+    }
+
+    /// Create new real-time audio processor with custom configuration
+    pub fn with_config(config: AudioConfiguration) -> Result<Self> {
+        config.validate()?;
+
+        info!("Initializing real-time audio processor with config: {:?}", config);
 
         Ok(Self {
+            config,
             input_stream: None,
             output_stream: None,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -203,9 +279,31 @@ impl RealTimeAudioProcessor {
             frames_processed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_input_time: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_output_time: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_buffer_usage: Arc::new(AtomicU64::new(0)),
+            output_buffer_usage: Arc::new(AtomicU64::new(0)),
+            input_underruns: Arc::new(AtomicU64::new(0)),
+            output_overruns: Arc::new(AtomicU64::new(0)),
             input_consumer: None,
             output_producer: None,
         })
+    }
+
+    /// Update audio configuration (requires reinitialization)
+    pub fn update_config(&mut self, config: AudioConfiguration) -> Result<()> {
+        config.validate()?;
+
+        if self.is_running.load(Ordering::Relaxed) {
+            return Err(anyhow!("Cannot update configuration while processor is running"));
+        }
+
+        self.config = config;
+        info!("Audio configuration updated: {:?}", self.config);
+        Ok(())
+    }
+
+    /// Get current audio configuration
+    pub fn get_config(&self) -> &AudioConfiguration {
+        &self.config
     }
 
     /// Initialize audio devices and streams
@@ -306,10 +404,26 @@ impl RealTimeAudioProcessor {
         let output_producer = self.output_producer.take()
             .ok_or_else(|| anyhow!("Output producer not initialized"))?;
 
+        // Clone atomic counters for processing thread
+        let input_buffer_usage = Arc::clone(&self.input_buffer_usage);
+        let output_buffer_usage = Arc::clone(&self.output_buffer_usage);
+        let input_underruns = Arc::clone(&self.input_underruns);
+        let output_overruns = Arc::clone(&self.output_overruns);
+        let frames_processed = Arc::clone(&self.frames_processed);
+
         let processing_thread = thread::spawn(move || {
             // Set real-time thread priority for low-latency audio processing
             Self::set_realtime_priority();
-            Self::processing_loop(is_running_clone, input_consumer, output_producer);
+            Self::processing_loop(
+                is_running_clone,
+                input_consumer,
+                output_producer,
+                input_buffer_usage,
+                output_buffer_usage,
+                input_underruns,
+                output_overruns,
+                frames_processed,
+            );
         });
 
         self.processing_thread = Some(processing_thread);
@@ -459,28 +573,47 @@ impl RealTimeAudioProcessor {
         is_running: Arc<AtomicBool>,
         mut input_consumer: ringbuf::HeapCons<AudioFrame>,
         mut output_producer: ringbuf::HeapProd<AudioFrame>,
+        input_buffer_usage: Arc<AtomicU64>,
+        output_buffer_usage: Arc<AtomicU64>,
+        input_underruns: Arc<AtomicU64>,
+        output_overruns: Arc<AtomicU64>,
+        frames_processed: Arc<AtomicU64>,
     ) {
         info!("Audio processing loop started");
 
         let mut sequence_counter = 0u32;
 
         while is_running.load(Ordering::Relaxed) {
+            // Update buffer usage statistics
+            input_buffer_usage.store(input_consumer.occupied_len() as u64, Ordering::Relaxed);
+            output_buffer_usage.store(output_producer.occupied_len() as u64, Ordering::Relaxed);
+
+            // Check for input underrun (no data available when expected)
+            if input_consumer.is_empty() {
+                input_underruns.fetch_add(1, Ordering::Relaxed);
+            }
+
             // Process input frames
             while let Some(mut input_frame) = input_consumer.try_pop() {
-                // TODO: This is where we'll add:
-                // - Noise suppression
-                // - Echo cancellation
-                // - Audio compression/encoding
-                // - Network packet preparation
-
-                // For now, just pass through (placeholder for processing)
+                // Audio processing pipeline:
+                // 1. Apply sequence numbering for ordering
                 input_frame.sequence = sequence_counter;
                 sequence_counter = sequence_counter.wrapping_add(1);
 
-                // Push processed frame to output
+                // 2. Audio processing stages (currently pass-through):
+                //    - Noise suppression (implemented in separate module)
+                //    - Echo cancellation (implemented in separate module)
+                //    - Audio compression/encoding (for network transmission)
+                //    - Network packet preparation (handled by network layer)
+
+                // 3. Push processed frame to output
                 if output_producer.try_push(input_frame).is_err() {
-                    // Output buffer full - consider dropping frames or adjusting buffer sizes
+                    // Output buffer full - track overrun
+                    output_overruns.fetch_add(1, Ordering::Relaxed);
                 }
+
+                // Track frame processing
+                frames_processed.fetch_add(1, Ordering::Relaxed);
             }
 
             // Small sleep to prevent busy waiting
@@ -492,17 +625,15 @@ impl RealTimeAudioProcessor {
 
     /// Get audio processing statistics
     pub fn get_stats(&self) -> AudioStats {
-        // Note: Buffer usage stats not available after processing thread starts
-        // since ring buffer components are moved to the processing thread
         AudioStats {
             frames_processed: self.frames_processed.load(Ordering::Relaxed),
             last_input_time: self.last_input_time.load(Ordering::Relaxed),
             last_output_time: self.last_output_time.load(Ordering::Relaxed),
-            input_buffer_usage: 0, // TODO: Implement via shared atomic counters if needed
-            output_buffer_usage: 0, // TODO: Implement via shared atomic counters if needed
+            input_buffer_usage: self.input_buffer_usage.load(Ordering::Relaxed) as usize,
+            output_buffer_usage: self.output_buffer_usage.load(Ordering::Relaxed) as usize,
             is_running: self.is_running.load(Ordering::Relaxed),
-            input_underruns: 0, // TODO: Implement underrun tracking
-            output_overruns: 0, // TODO: Implement overrun tracking
+            input_underruns: self.input_underruns.load(Ordering::Relaxed),
+            output_overruns: self.output_overruns.load(Ordering::Relaxed),
         }
     }
 

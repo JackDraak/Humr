@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
-use cpal::{Device, Host, Stream, StreamConfig, SampleFormat, SampleRate};
+use cpal::{Device, Host, Stream, StreamConfig, SampleRate};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use crossbeam::queue::SegQueue;
 
 // Cross-platform audio adapter using CPAL
@@ -51,7 +51,7 @@ impl PlatformAudioAdapter {
 
         // Configure input stream
         if let Some(ref input_device) = self.input_device {
-            let input_config = input_device
+            let _input_config = input_device
                 .default_input_config()
                 .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
 
@@ -64,7 +64,7 @@ impl PlatformAudioAdapter {
 
         // Configure output stream
         if let Some(ref output_device) = self.output_device {
-            let output_config = output_device
+            let _output_config = output_device
                 .default_output_config()
                 .map_err(|e| anyhow!("Failed to get output config: {}", e))?;
 

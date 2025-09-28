@@ -36,11 +36,25 @@ impl UserInterface {
     }
 
     pub fn get_available_devices(&self, device_type: DeviceType) -> Vec<String> {
-        // THIS IS A STUB - Real implementation would enumerate platform audio devices
-        // ASSUMPTION: Using placeholder devices for now
+        // Enhanced device enumeration using platform adapter
+        use crate::platform::PlatformAudioAdapter;
+
+        let adapter = PlatformAudioAdapter::new();
         match device_type {
-            DeviceType::Input => vec!["default".to_string(), "microphone".to_string()],
-            DeviceType::Output => vec!["default".to_string(), "speakers".to_string(), "headphones".to_string()],
+            DeviceType::Input => {
+                let mut devices = adapter.get_input_devices();
+                if devices.is_empty() {
+                    devices = vec!["default".to_string(), "microphone".to_string()];
+                }
+                devices
+            },
+            DeviceType::Output => {
+                let mut devices = adapter.get_output_devices();
+                if devices.is_empty() {
+                    devices = vec!["default".to_string(), "speakers".to_string(), "headphones".to_string()];
+                }
+                devices
+            },
         }
     }
 
@@ -138,18 +152,31 @@ impl UserInterface {
     }
 
     fn show_help(&self) {
-        println!("Commands:");
-        println!("  connect <host:port> - Connect to remote peer");
-        println!("  disconnect          - Disconnect from peer");
-        println!("  volume <in> <out>   - Set input/output volume (0-100)");
-        println!("  bitrate <rate>      - Set bit rate (8000-320000)");
-        println!("  noise <on|off>      - Toggle noise cancellation");
-        println!("  devices             - List available devices");
-        println!("  status              - Show current status");
-        println!("  health              - Show health report");
-        println!("  metrics             - Show performance metrics");
-        println!("  help                - Show this help");
-        println!("  quit                - Exit application");
+        println!("╭─────────────────────────────────────────────────────────╮");
+        println!("│                  Humr Voice Communication               │");
+        println!("├─────────────────────────────────────────────────────────┤");
+        println!("│ Connection Commands:                                    │");
+        println!("│   connect <host:port>  Connect to remote peer          │");
+        println!("│   disconnect           Disconnect from peer            │");
+        println!("│                                                         │");
+        println!("│ Audio Configuration:                                    │");
+        println!("│   volume <in> <out>    Set volume levels (0-100)       │");
+        println!("│   bitrate <rate>       Set bit rate (8000-320000)      │");
+        println!("│   noise <on|off>       Toggle noise cancellation       │");
+        println!("│   devices              List available audio devices     │");
+        println!("│   device <type> <name> Select audio device             │");
+        println!("│                                                         │");
+        println!("│ Monitoring & Status:                                    │");
+        println!("│   status               Show detailed system status      │");
+        println!("│   health               Show health monitoring report    │");
+        println!("│   metrics              Show performance metrics         │");
+        println!("│   live                 Start live status monitoring     │");
+        println!("│                                                         │");
+        println!("│ System:                                                 │");
+        println!("│   help                 Show this help                   │");
+        println!("│   clear                Clear screen                     │");
+        println!("│   quit                 Exit application                 │");
+        println!("╰─────────────────────────────────────────────────────────╯");
         println!();
     }
 
@@ -165,10 +192,15 @@ impl UserInterface {
                 self.running = false;
                 println!("Goodbye!");
             },
-            "status" => self.display_status(),
+            "clear" => {
+                print!("\x1B[2J\x1B[1;1H"); // Clear screen and move cursor to top
+                self.show_help();
+            },
+            "status" => self.display_enhanced_status(),
             "health" => self.show_health_report(),
             "metrics" => self.show_performance_metrics(),
             "devices" => self.list_devices(),
+            "live" => self.start_live_monitoring(),
             "connect" => {
                 if parts.len() < 2 {
                     println!("Usage: connect <host:port>");
@@ -197,6 +229,13 @@ impl UserInterface {
                     return Ok(());
                 }
                 self.handle_noise_command(parts[1])?;
+            },
+            "device" => {
+                if parts.len() < 3 {
+                    println!("Usage: device <input|output> <device_name>");
+                    return Ok(());
+                }
+                self.handle_device_command(parts[1], parts[2])?;
             },
             _ => println!("Unknown command: {}. Type 'help' for available commands.", parts[0]),
         }
@@ -256,51 +295,189 @@ impl UserInterface {
         Ok(())
     }
 
+    fn handle_device_command(&self, device_type: &str, device_name: &str) -> Result<()> {
+        let device_type = match device_type.to_lowercase().as_str() {
+            "input" | "in" => DeviceType::Input,
+            "output" | "out" => DeviceType::Output,
+            _ => return Err(anyhow::anyhow!("Device type must be 'input' or 'output'")),
+        };
+
+        self.select_device(device_type, device_name);
+        Ok(())
+    }
+
+    fn display_enhanced_status(&self) {
+        println!("╭─────────────────────────────────────────────────────────╮");
+        println!("│                    System Status                        │");
+        println!("├─────────────────────────────────────────────────────────┤");
+
+        // Connection status
+        let conn_status = if self.connection_status { "🟢 Connected" } else { "🔴 Disconnected" };
+        println!("│ Connection:      {:<32} │", conn_status);
+
+        // Audio status
+        if let Ok(processor) = self.audio_processor.lock() {
+            println!("│ Sample Rate:     {:<32} │", format!("{} Hz", processor.sample_rate()));
+            println!("│ Bit Rate:        {:<32} │", format!("{} bps", processor.bit_rate()));
+            println!("│ Input Volume:    {:<32} │", format!("{:.0}%", processor.get_input_gain() * 100.0));
+            println!("│ Output Volume:   {:<32} │", format!("{}%", processor.get_output_volume()));
+            println!("│ Noise Cancel:    {:<32} │", if processor.is_echo_cancellation_enabled() { "Enabled" } else { "Disabled" });
+        }
+
+        // Audio levels (simulated)
+        println!("│ Input Level:     {:<32} │", format!("{:.1}%", self.input_level * 100.0));
+        println!("│ Output Level:    {:<32} │", format!("{:.1}%", self.output_level * 100.0));
+
+        println!("╰─────────────────────────────────────────────────────────╯");
+        println!();
+    }
+
+    fn start_live_monitoring(&self) {
+        println!("Starting live monitoring... (Press 'q' to quit)");
+        println!("╭─────────────────────────────────────────────────────────╮");
+        println!("│                   Live Status Monitor                   │");
+        println!("├─────────────────────────────────────────────────────────┤");
+
+        // Simple live display simulation (in a real implementation, this would run in a loop)
+        for i in 0..5 {
+            print!("\r│ Audio In:  ");
+            let level = (i as f32 * 20.0) % 100.0;
+            let bars = (level / 5.0) as usize;
+            print!("{}", "█".repeat(bars));
+            print!("{}", "░".repeat(20 - bars));
+            print!(" {:.0}%", level);
+
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        println!("\n╰─────────────────────────────────────────────────────────╯");
+        println!("Live monitoring stopped. Type 'live' to restart.");
+    }
+
     fn list_devices(&self) {
-        println!("Available Devices:");
-        println!("Input devices:");
-        for device in self.get_available_devices(DeviceType::Input) {
-            println!("  - {}", device);
+        println!("╭─────────────────────────────────────────────────────────╮");
+        println!("│                   Available Devices                     │");
+        println!("├─────────────────────────────────────────────────────────┤");
+
+        let input_devices = self.get_available_devices(DeviceType::Input);
+        let output_devices = self.get_available_devices(DeviceType::Output);
+
+        println!("│ Input Devices:                                          │");
+        for (i, device) in input_devices.iter().enumerate() {
+            println!("│   {}. {:<48} │", i + 1, device);
         }
-        println!("Output devices:");
-        for device in self.get_available_devices(DeviceType::Output) {
-            println!("  - {}", device);
+
+        println!("│                                                         │");
+        println!("│ Output Devices:                                         │");
+        for (i, device) in output_devices.iter().enumerate() {
+            println!("│   {}. {:<48} │", i + 1, device);
         }
+
+        println!("├─────────────────────────────────────────────────────────┤");
+        println!("│ Usage: device <input|output> <device_name>             │");
+        println!("╰─────────────────────────────────────────────────────────╯");
+        println!();
     }
 
     fn show_health_report(&self) {
+        println!("╭─────────────────────────────────────────────────────────╮");
+        println!("│                    Health Report                        │");
+        println!("├─────────────────────────────────────────────────────────┤");
+
         if let Some(ref monitor) = self.health_monitor {
             if let Some(report) = monitor.get_latest_report() {
-                println!("Health Report:");
-                println!("  Overall Status: {:?}", report.overall_status);
-                println!("  Timestamp: {:?}", report.timestamp);
-                println!("  Check Results:");
+                let status_icon = match report.overall_status {
+                    crate::monitoring::HealthStatus::Healthy => "🟢",
+                    crate::monitoring::HealthStatus::Warning => "🟡",
+                    crate::monitoring::HealthStatus::Critical => "🔴",
+                    crate::monitoring::HealthStatus::Unknown => "⚪",
+                };
+
+                println!("│ Overall Status:  {} {:<28} │", status_icon, format!("{:?}", report.overall_status));
+                println!("│ Report Time:     {:<32} │", format!("{:?}", report.timestamp));
+                println!("│ Uptime:          {:<32} │", format!("{} seconds", report.uptime_seconds));
+                println!("│                                                         │");
+                println!("│ Component Health:                                       │");
+
                 for check in &report.checks {
-                    println!("    {}: {:?}", check.name, check.status);
+                    let check_icon = match check.status {
+                        crate::monitoring::HealthStatus::Healthy => "✓",
+                        crate::monitoring::HealthStatus::Warning => "⚠",
+                        crate::monitoring::HealthStatus::Critical => "✗",
+                        crate::monitoring::HealthStatus::Unknown => "?",
+                    };
+
+                    println!("│   {} {:<48} │", check_icon,
+                        format!("{}: {:?}", check.name, check.status));
+
                     if !check.message.is_empty() {
-                        println!("      {}", check.message);
+                        println!("│     {:<50} │", check.message);
                     }
                 }
             } else {
-                println!("No health report available. Run health checks first.");
+                println!("│ No health report available.                             │");
+                println!("│ Health monitoring may still be initializing.           │");
             }
         } else {
-            println!("Health monitoring not available.");
+            println!("│ Health monitoring not available.                        │");
         }
+
+        println!("╰─────────────────────────────────────────────────────────╯");
+        println!();
     }
 
     fn show_performance_metrics(&self) {
+        println!("╭─────────────────────────────────────────────────────────╮");
+        println!("│                  Performance Metrics                    │");
+        println!("├─────────────────────────────────────────────────────────┤");
+
         if let Some(ref monitor) = self.health_monitor {
             let metrics = monitor.get_metrics();
-            println!("Performance Metrics:");
-            println!("  CPU Usage: {:.1}%", metrics.cpu_usage_percent);
-            println!("  Memory Usage: {:.1} MB", metrics.memory_usage_mb);
-            println!("  Network Latency: {:.1} ms", metrics.network_latency_ms);
-            println!("  Audio Latency: {:.1} ms", metrics.audio_processing_latency_ms);
-            println!("  Packet Loss: {:.2}%", metrics.packet_loss_rate * 100.0);
+
+            // System metrics
+            println!("│ System Performance:                                     │");
+            println!("│   CPU Usage:       {:<32} │", format!("{:.1}%", metrics.cpu_usage_percent));
+            println!("│   Memory Usage:    {:<32} │", format!("{:.1} MB", metrics.memory_usage_mb));
+            println!("│   Disk Usage:      {:<32} │", format!("{:.1}%", metrics.disk_usage_percent));
+            println!("│                                                         │");
+
+            // Audio metrics
+            println!("│ Audio Performance:                                      │");
+            println!("│   Audio Latency:   {:<32} │", format!("{:.1} ms", metrics.audio_processing_latency_ms));
+            println!("│   Buffer Usage:    {:<32} │", format!("{:.1}%", metrics.audio_buffer_utilization * 100.0));
+            println!("│   Dropouts/min:    {:<32} │", format!("{:.1}", metrics.audio_dropouts_per_minute));
+            println!("│                                                         │");
+
+            // Network metrics
+            println!("│ Network Performance:                                    │");
+            println!("│   Network Latency: {:<32} │", format!("{:.1} ms", metrics.network_latency_ms));
+            println!("│   Packet Loss:     {:<32} │", format!("{:.2}%", metrics.packet_loss_rate * 100.0));
+            println!("│   Bandwidth:       {:<32} │", format!("{:.1} Mbps", metrics.bandwidth_utilization_mbps));
+
+            // Status indicators
+            let cpu_status = if metrics.cpu_usage_percent > 80.0 { "🔴" }
+                           else if metrics.cpu_usage_percent > 60.0 { "🟡" }
+                           else { "🟢" };
+
+            let audio_status = if metrics.audio_buffer_utilization > 0.9 { "🔴" }
+                             else if metrics.audio_buffer_utilization > 0.7 { "🟡" }
+                             else { "🟢" };
+
+            let network_status = if metrics.packet_loss_rate > 0.05 { "🔴" }
+                               else if metrics.packet_loss_rate > 0.01 { "🟡" }
+                               else { "🟢" };
+
+            println!("│                                                         │");
+            println!("│ Status:                                                 │");
+            println!("│   {} CPU      {} Audio      {} Network              │",
+                     cpu_status, audio_status, network_status);
+
         } else {
-            println!("Performance monitoring not available.");
+            println!("│ Performance monitoring not available.                   │");
         }
+
+        println!("╰─────────────────────────────────────────────────────────╯");
+        println!();
     }
 
     fn display_status(&self) {

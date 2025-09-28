@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use anyhow::Result;
 
 pub struct AudioProcessor {
     input_device: String,
@@ -64,6 +61,18 @@ impl AudioProcessor {
 
     pub fn set_echo_cancellation(&mut self, enabled: bool) {
         self.echo_cancellation_enabled = enabled;
+    }
+
+    pub fn get_input_gain(&self) -> f32 {
+        self.input_gain
+    }
+
+    pub fn get_output_volume(&self) -> u8 {
+        self.output_volume
+    }
+
+    pub fn is_echo_cancellation_enabled(&self) -> bool {
+        self.echo_cancellation_enabled
     }
 
     // Bit-rate control
