@@ -120,6 +120,15 @@ pub mod monitoring;
 /// Error handling with circuit breakers and automatic recovery
 pub mod error_recovery;
 
+/// Revolutionary UX with zero-config P2P discovery
+pub mod discovery;
+
+/// Terminal user interface with ratatui
+pub mod terminal_ui;
+
+/// Lighthouse service for P2P discovery and connection management
+pub mod lighthouse;
+
 #[cfg(test)]
 pub mod tests;
 
@@ -129,3 +138,5 @@ pub use config::AppConfig;
 pub use realtime_audio::{AudioConfiguration, RealTimeAudioProcessor};
 pub use security::{SecurityConfig, SecureSession};
 pub use monitoring::{HealthMonitor, MetricsCollector, HealthReport};
+pub use discovery::{DiscoveryManager, RoomInfo, ConnectionMethod, MagicLinkService, QRCodeGenerator};
+pub use terminal_ui::{TerminalApp, run_terminal_ui};

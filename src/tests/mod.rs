@@ -7,3 +7,4 @@ mod security_tests;
 mod integration_tests;
 mod cross_platform_tests;
 mod error_recovery_tests;
+mod lighthouse_tests;
